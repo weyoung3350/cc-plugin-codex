@@ -1,0 +1,37 @@
+{
+  "name": "cc-plugin-codex",
+  "version": "0.0.1",
+  "description": "Use Claude Code from Codex CLI: ask, review, or delegate tasks to local Claude, with session continuity and background jobs.",
+  "author": {
+    "name": "weyoung3350",
+    "url": "https://github.com/weyoung3350"
+  },
+  "homepage": "https://github.com/weyoung3350/cc-plugin-codex",
+  "repository": "https://github.com/weyoung3350/cc-plugin-codex",
+  "license": "Apache-2.0",
+  "keywords": [
+    "cc-plugin-codex",
+    "claude",
+    "claude-code",
+    "codex",
+    "mcp",
+    "delegation",
+    "bridge"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Claude Code Bridge",
+    "shortDescription": "Delegate tasks from Codex to local Claude Code and get structured results back",
+    "longDescription": "Bridge between Codex and a local Claude Code CLI. The Codex model can delegate tasks to Claude via MCP tools and receive structured results back. Designed for: asking Claude about code, getting second-opinion reviews with JSON-schema output, and delegating focused edit tasks. Uses Claude's native --session-id/--resume for session continuity. Runs Claude as a controlled subruntime (--bare --permission-mode=plan --strict-mcp-config). NOT a security sandbox. POSIX-only (macOS/Linux). Requires ANTHROPIC_API_KEY or apiKeyHelper.",
+    "developerName": "weyoung3350",
+    "category": "Coding",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/weyoung3350/cc-plugin-codex",
+    "defaultPrompt": "Ask Claude Code to review this change, or delegate a focused edit task."
+  }
+}

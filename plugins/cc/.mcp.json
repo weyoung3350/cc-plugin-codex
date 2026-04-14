@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "claude-code": {
+      "command": "node",
+      "args": [
+        "./scripts/claude-broker.mjs"
+      ]
+    }
+  }
+}
