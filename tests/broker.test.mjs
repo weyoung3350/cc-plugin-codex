@@ -91,6 +91,11 @@ function fakeRunChild({ stdout = "", stderr = "", exitCode = 0, delayMs = 0 } = 
 }
 
 function mockHealthHappy() {
+  // Ensure every broker test has a writable state dir: the health probe
+  // now checks state_dir writability as part of assertHealthy(). Tests
+  // that already set up their own scratch dir (e.g. session_id tests)
+  // will override this value when they call setupScratchStateDir().
+  if (!activeScratchDir) setupScratchStateDir();
   process.env.ANTHROPIC_API_KEY = "sk-test";
   healthInternals.readSettings = () => null;
   healthInternals.spawnSync = (cmd, args) => {
@@ -103,6 +108,7 @@ function mockHealthHappy() {
 }
 
 function mockHealthNotInstalled() {
+  if (!activeScratchDir) setupScratchStateDir();
   delete process.env.ANTHROPIC_API_KEY;
   healthInternals.readSettings = () => null;
   healthInternals.spawnSync = () => ({

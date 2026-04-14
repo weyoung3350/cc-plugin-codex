@@ -352,15 +352,24 @@ async function runSyncToolBody(
 /** Wrap a HealthError into the standard MCP tool error envelope. */
 function healthErrorToolResult(err) {
   const reason = err instanceof HealthError ? err.reason : "unknown";
+  // For state-dir-not-writable we surface the stateDir hint verbatim
+  // (it already tells the user which chown / which env var to set).
+  const stateDirHint =
+    err instanceof HealthError &&
+    err.state &&
+    err.state.state_dir &&
+    err.state.state_dir.hint;
   const hint =
-    {
-      "not-installed":
-        "Install Claude Code CLI >= 2.1.105: https://docs.claude.com/en/docs/claude-code",
-      "auth-required":
-        "Run `claude /login` to log in with your Claude subscription, OR set ANTHROPIC_API_KEY, OR configure apiKeyHelper in ~/.claude/settings.json.",
-      "platform-unsupported":
-        "cc-plugin-codex supports macOS and Linux only. Windows is intentionally unsupported.",
-    }[reason] ?? "See claude_health for diagnostic detail.";
+    reason === "state-dir-not-writable" && stateDirHint
+      ? stateDirHint
+      : {
+          "not-installed":
+            "Install Claude Code CLI >= 2.1.105: https://docs.claude.com/en/docs/claude-code",
+          "auth-required":
+            "Run `claude /login` to log in with your Claude subscription, OR set ANTHROPIC_API_KEY, OR configure apiKeyHelper in ~/.claude/settings.json.",
+          "platform-unsupported":
+            "cc-plugin-codex supports macOS and Linux only. Windows is intentionally unsupported.",
+        }[reason] ?? "See claude_health for diagnostic detail.";
   return {
     content: [
       {
@@ -1027,7 +1036,17 @@ export function main() {
   const server = buildBroker();
 
   try {
-    probeHealth();
+    const s = probeHealth();
+    // If the state dir is unwritable, print the actionable hint NOW on
+    // stderr so a user who tailed the log can see it without having to
+    // call claude_health first. The tool gate also catches this, but
+    // stderr is the fastest feedback path for "why won't this work".
+    if (s.state_dir && s.state_dir.writable === false && s.state_dir.hint) {
+      process.stderr.write(
+        `[cc-plugin-codex] STATE DIR NOT WRITABLE — tools will refuse until fixed.\n`,
+      );
+      process.stderr.write(s.state_dir.hint + "\n");
+    }
   } catch (err) {
     process.stderr.write(
       `[cc-plugin-codex] health probe threw during startup: ${String(err)}\n`,

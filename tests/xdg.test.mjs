@@ -178,6 +178,58 @@ test("isUnderStateDir: ..foo is a descendant, not an escape", () => {
   }
 });
 
+test("checkStateDirWritable: happy path on fresh tmpdir", async () => {
+  const { checkStateDirWritable } = await import(
+    "../plugins/cc/scripts/lib/xdg.mjs"
+  );
+  const fs = await import("node:fs");
+  const tmp = fs.mkdtempSync(
+    path.join(os.tmpdir(), "ccpc-sdw-"),
+  );
+  const ORIG = process.env.CC_PLUGIN_CODEX_STATE_DIR;
+  process.env.CC_PLUGIN_CODEX_STATE_DIR = path.join(tmp, "state");
+  try {
+    const res = checkStateDirWritable();
+    assert.equal(res.ok, true);
+    assert.equal(res.path, path.join(tmp, "state"));
+    assert.ok(fs.existsSync(res.path));
+  } finally {
+    if (ORIG === undefined) delete process.env.CC_PLUGIN_CODEX_STATE_DIR;
+    else process.env.CC_PLUGIN_CODEX_STATE_DIR = ORIG;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("checkStateDirWritable: unwritable parent → ok:false + actionable hint", async () => {
+  const { checkStateDirWritable } = await import(
+    "../plugins/cc/scripts/lib/xdg.mjs"
+  );
+  const fs = await import("node:fs");
+  const tmp = fs.mkdtempSync(
+    path.join(os.tmpdir(), "ccpc-sdw-"),
+  );
+  // Make tmp read-only → mkdir inside it will EACCES.
+  const sealed = path.join(tmp, "sealed");
+  fs.mkdirSync(sealed);
+  fs.chmodSync(sealed, 0o555);
+  const ORIG = process.env.CC_PLUGIN_CODEX_STATE_DIR;
+  process.env.CC_PLUGIN_CODEX_STATE_DIR = path.join(sealed, "state");
+  try {
+    const res = checkStateDirWritable();
+    assert.equal(res.ok, false);
+    assert.equal(typeof res.error, "string");
+    assert.ok(res.hint && res.hint.length > 0);
+    assert.match(res.hint, /chown/);
+    assert.match(res.hint, /XDG_STATE_HOME/);
+    assert.match(res.hint, /CC_PLUGIN_CODEX_STATE_DIR/);
+  } finally {
+    if (ORIG === undefined) delete process.env.CC_PLUGIN_CODEX_STATE_DIR;
+    else process.env.CC_PLUGIN_CODEX_STATE_DIR = ORIG;
+    fs.chmodSync(sealed, 0o755);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test("isPlatformSupported", () => {
   const p = process.platform;
   const expected = p === "darwin" || p === "linux";

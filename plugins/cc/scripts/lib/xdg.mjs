@@ -9,7 +9,7 @@
 
 import os from "node:os";
 import path from "node:path";
-import { realpathSync } from "node:fs";
+import { mkdirSync, realpathSync, accessSync, constants as fsConstants } from "node:fs";
 import { createHash } from "node:crypto";
 
 const APP_NAME = "cc-plugin-codex";
@@ -113,6 +113,36 @@ export function jobDir(jobId) {
  * @param {string} workspaceRoot  Absolute, already-realpath'd workspace root.
  * @returns {string}
  */
+export function checkStateDirWritable() {
+  const target = stateRoot();
+  try {
+    mkdirSync(target, { recursive: true });
+    accessSync(target, fsConstants.W_OK | fsConstants.X_OK);
+    return { ok: true, path: target };
+  } catch (err) {
+    const code = err && err.code ? err.code : "unknown";
+    return {
+      ok: false,
+      path: target,
+      error: code,
+      hint: buildStateDirHint(target, code),
+    };
+  }
+}
+
+function buildStateDirHint(target, code) {
+  const altPath = path.join(os.homedir(), "Library", "Application Support");
+  return [
+    `broker cannot write to $STATE_DIR (${target}); errno=${code}.`,
+    `Fix options:`,
+    `  1. Reclaim ownership: sudo chown -R $(id -un):$(id -gn) "${path.dirname(target)}"`,
+    `  2. Point elsewhere:   codex mcp remove claude-code && \\`,
+    `       codex mcp add claude-code --env XDG_STATE_HOME="${altPath}" -- \\`,
+    `       node <abs-path-to-claude-broker.mjs>`,
+    `  3. Direct override:   set CC_PLUGIN_CODEX_STATE_DIR to any absolute writable path.`,
+  ].join("\n");
+}
+
 export function ackFlagPath(workspaceRoot) {
   if (!path.isAbsolute(workspaceRoot)) {
     throw new Error(

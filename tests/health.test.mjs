@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 import {
   probeHealth,
@@ -13,6 +16,16 @@ import {
 const ORIG_SPAWN = _internals.spawnSync;
 const ORIG_READ = _internals.readSettings;
 const ORIG_ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
+const ORIG_STATE_DIR = process.env.CC_PLUGIN_CODEX_STATE_DIR;
+
+// All tests get a writable per-test scratch state dir. Without this, the
+// new state-dir-writable gate would fail on machines where the default
+// $HOME/.local/state is root-owned (a real scenario we're fixing).
+let scratchStateDir = null;
+function setupScratchStateDir() {
+  scratchStateDir = fs.mkdtempSync(path.join(os.tmpdir(), "ccpc-health-"));
+  process.env.CC_PLUGIN_CODEX_STATE_DIR = scratchStateDir;
+}
 
 function restore() {
   _internals.spawnSync = ORIG_SPAWN;
@@ -20,6 +33,15 @@ function restore() {
   _setCached(null);
   if (ORIG_ANTHROPIC_KEY === undefined) delete process.env.ANTHROPIC_API_KEY;
   else process.env.ANTHROPIC_API_KEY = ORIG_ANTHROPIC_KEY;
+  if (ORIG_STATE_DIR === undefined)
+    delete process.env.CC_PLUGIN_CODEX_STATE_DIR;
+  else process.env.CC_PLUGIN_CODEX_STATE_DIR = ORIG_STATE_DIR;
+  if (scratchStateDir) {
+    try {
+      fs.rmSync(scratchStateDir, { recursive: true, force: true });
+    } catch {}
+    scratchStateDir = null;
+  }
 }
 
 // Helper: a fake spawnSync that routes by argv[0]/first arg.
@@ -33,6 +55,7 @@ function fakeSpawn({ version, probe }) {
 }
 
 test("probeHealth: not installed when claude --version spawn fails with ENOENT", () => {
+  setupScratchStateDir();
   try {
     _internals.spawnSync = () => ({
       error: Object.assign(new Error("no such file"), { code: "ENOENT" }),
@@ -53,6 +76,7 @@ test("probeHealth: not installed when claude --version spawn fails with ENOENT",
 });
 
 test("probeHealth: happy path sets all flags", () => {
+  setupScratchStateDir();
   try {
     process.env.ANTHROPIC_API_KEY = "sk-test";
     _internals.spawnSync = fakeSpawn({
@@ -88,6 +112,7 @@ test("probeHealth: happy path sets all flags", () => {
 });
 
 test("probeHealth: version parsing tolerates trailing extras", () => {
+  setupScratchStateDir();
   try {
     _internals.spawnSync = fakeSpawn({
       version: {
@@ -113,6 +138,7 @@ test("probeHealth: version parsing tolerates trailing extras", () => {
 });
 
 test("probeHealth: probe returns non-JSON → warns, not authenticated", () => {
+  setupScratchStateDir();
   try {
     _internals.spawnSync = fakeSpawn({
       version: { error: null, status: 0, stdout: "2.1.105\n", stderr: "", signal: null },
@@ -128,6 +154,7 @@ test("probeHealth: probe returns non-JSON → warns, not authenticated", () => {
 });
 
 test("probeHealth: probe stderr mentions auth → auth-required warning", () => {
+  setupScratchStateDir();
   try {
     _internals.spawnSync = fakeSpawn({
       version: { error: null, status: 0, stdout: "2.1.105\n", stderr: "", signal: null },
@@ -148,6 +175,7 @@ test("probeHealth: probe stderr mentions auth → auth-required warning", () => 
 });
 
 test("getHealth caches and refresh reprobes", () => {
+  setupScratchStateDir();
   try {
     let calls = 0;
     const sp = fakeSpawn({
@@ -170,6 +198,7 @@ test("getHealth caches and refresh reprobes", () => {
 });
 
 test("assertHealthy throws HealthError when not installed", () => {
+  setupScratchStateDir();
   try {
     _internals.spawnSync = () => ({
       error: Object.assign(new Error("no such file"), { code: "ENOENT" }),
@@ -188,6 +217,7 @@ test("assertHealthy throws HealthError when not installed", () => {
 });
 
 test("assertHealthy throws when installed but not authenticated", () => {
+  setupScratchStateDir();
   try {
     _internals.spawnSync = fakeSpawn({
       version: { error: null, status: 0, stdout: "2.1.105\n", stderr: "", signal: null },
@@ -203,6 +233,7 @@ test("assertHealthy throws when installed but not authenticated", () => {
 });
 
 test("probeHealth: probe timeout classified as probe-timeout warning", () => {
+  setupScratchStateDir();
   try {
     _internals.spawnSync = (cmd, args, opts) => {
       if (args[0] === "--version") {
@@ -227,6 +258,7 @@ test("probeHealth: probe timeout classified as probe-timeout warning", () => {
 });
 
 test("probeHealth: api_key_source = helper when settings.apiKeyHelper present", () => {
+  setupScratchStateDir();
   try {
     delete process.env.ANTHROPIC_API_KEY;
     _internals.readSettings = () => ({ apiKeyHelper: "/path/to/helper.sh" });
@@ -242,6 +274,7 @@ test("probeHealth: api_key_source = helper when settings.apiKeyHelper present", 
 });
 
 test("probeHealth: api_key_source = oauth when probe succeeds without env/helper", () => {
+  setupScratchStateDir();
   try {
     delete process.env.ANTHROPIC_API_KEY;
     _internals.readSettings = () => null;
@@ -260,6 +293,7 @@ test("probeHealth: api_key_source = oauth when probe succeeds without env/helper
 });
 
 test("probeHealth: api_key_source = null when probe fails and no env/helper", () => {
+  setupScratchStateDir();
   try {
     delete process.env.ANTHROPIC_API_KEY;
     _internals.readSettings = () => null;
@@ -283,6 +317,7 @@ test("probeHealth: api_key_source = null when probe fails and no env/helper", ()
 });
 
 test("probeHealth: platform unsupported short-circuits, no spawn", () => {
+  setupScratchStateDir();
   try {
     let spawned = false;
     _internals.spawnSync = () => {
@@ -308,6 +343,7 @@ test("probeHealth: platform unsupported short-circuits, no spawn", () => {
 });
 
 test("assertHealthy throws platform-unsupported on non-POSIX", () => {
+  setupScratchStateDir();
   try {
     const origPlat = process.platform;
     Object.defineProperty(process, "platform", { value: "win32", configurable: true });
@@ -324,7 +360,59 @@ test("assertHealthy throws platform-unsupported on non-POSIX", () => {
   }
 });
 
+test("probeHealth: includes state_dir field with writable + hint", async () => {
+  setupScratchStateDir();
+  try {
+    process.env.ANTHROPIC_API_KEY = "sk-test";
+    _internals.spawnSync = fakeSpawn({
+      version: { error: null, status: 0, stdout: "2.1.105\n", stderr: "", signal: null },
+      probe: { error: null, status: 0, stdout: "{}", stderr: "", signal: null },
+    });
+    const s = probeHealth();
+    assert.ok(s.state_dir);
+    assert.equal(typeof s.state_dir.path, "string");
+    assert.equal(typeof s.state_dir.writable, "boolean");
+    // Default HOME .local/state should normally be writable on a dev machine.
+    // The point of the test is the field exists with correct shape, not the
+    // specific value (CI environments vary).
+  } finally {
+    restore();
+  }
+});
+
+test("assertHealthy throws state-dir-not-writable when writable=false", async () => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ccpc-sdw-h-"));
+  const sealed = path.join(tmp, "sealed");
+  fs.mkdirSync(sealed);
+  fs.chmodSync(sealed, 0o555);
+  const ORIG = process.env.CC_PLUGIN_CODEX_STATE_DIR;
+  // NOTE: we DO NOT call setupScratchStateDir() here — the whole point
+  // of this test is a NON-writable state dir.
+  process.env.CC_PLUGIN_CODEX_STATE_DIR = path.join(sealed, "state");
+  try {
+    process.env.ANTHROPIC_API_KEY = "sk-test";
+    _internals.spawnSync = fakeSpawn({
+      version: { error: null, status: 0, stdout: "2.1.105\n", stderr: "", signal: null },
+      probe: { error: null, status: 0, stdout: "{}", stderr: "", signal: null },
+    });
+    assert.throws(
+      () => assertHealthy(),
+      (err) => err instanceof HealthError && err.reason === "state-dir-not-writable",
+    );
+  } finally {
+    if (ORIG === undefined) delete process.env.CC_PLUGIN_CODEX_STATE_DIR;
+    else process.env.CC_PLUGIN_CODEX_STATE_DIR = ORIG;
+    fs.chmodSync(sealed, 0o755);
+    fs.rmSync(tmp, { recursive: true, force: true });
+    restore();
+  }
+});
+
 test("assertHealthy returns state on success", () => {
+  setupScratchStateDir();
   try {
     process.env.ANTHROPIC_API_KEY = "sk-test";
     _internals.spawnSync = fakeSpawn({

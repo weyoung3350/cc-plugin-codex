@@ -30,7 +30,7 @@ import { readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { isPlatformSupported } from "./xdg.mjs";
+import { isPlatformSupported, checkStateDirWritable } from "./xdg.mjs";
 
 const DEFAULT_CLAUDE_BIN = "claude";
 const PROBE_TIMEOUT_MS = 30_000;
@@ -85,12 +85,18 @@ export function probeHealth(opts = {}) {
       authenticated: false,
       api_key_source: null,
       platform_supported: false,
+      state_dir: { path: null, writable: false, hint: null },
       warnings: ["platform-unsupported"],
       checked_at_ms: Date.now(),
     };
     cached = state;
     return state;
   }
+
+  // Check $STATE_DIR writability up-front. This catches misconfigured
+  // machines (e.g. $HOME/.local owned by root) BEFORE any tool call fails
+  // with a raw EACCES from mkdir deep in tracked-jobs.
+  const stateDirProbe = checkStateDirWritable();
 
   // --- Step 1: claude --version ---
   let installed = false;
@@ -215,12 +221,20 @@ export function probeHealth(opts = {}) {
     }
   }
 
+  if (!stateDirProbe.ok) {
+    warnings.push(`state-dir-not-writable:${stateDirProbe.error}`);
+  }
   const state = {
     installed,
     version,
     authenticated,
     api_key_source,
     platform_supported,
+    state_dir: {
+      path: stateDirProbe.path,
+      writable: stateDirProbe.ok,
+      hint: stateDirProbe.ok ? null : stateDirProbe.hint,
+    },
     warnings,
     checked_at_ms: Date.now(),
   };
@@ -259,6 +273,9 @@ export function assertHealthy(opts = {}) {
   const s = getHealth(opts);
   if (!s.platform_supported) throw new HealthError("platform-unsupported", s);
   if (!s.installed) throw new HealthError("not-installed", s);
+  if (s.state_dir && s.state_dir.writable === false) {
+    throw new HealthError("state-dir-not-writable", s);
+  }
   if (!s.authenticated) throw new HealthError("auth-required", s);
   return s;
 }
