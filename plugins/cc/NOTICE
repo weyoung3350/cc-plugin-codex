@@ -1,0 +1,9 @@
+cc-plugin-codex
+Copyright 2026 weyoung3350
+
+Licensed under the Apache License, Version 2.0 (the "License").
+
+This product takes design inspiration from OpenAI's codex-plugin-cc
+(https://github.com/openai/codex-plugin-cc), which provides the
+inverse direction (Claude Code → Codex). The architecture is independent
+and re-implemented in this repository.

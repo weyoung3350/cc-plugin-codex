@@ -1,0 +1,10 @@
+interface:
+  display_name: "Claude Code 桥接"
+  short_description: "从 Codex 委托任务给本机 Claude Code 并取回结果"
+  default_prompt: "让 Claude Code 审一下这段改动，或委托一个聚焦的编辑任务给它。"
+
+# 本插件自身就是一个 stdio MCP server（plugins/cc/.mcp.json 声明），
+# 不依赖任何外部 MCP server。Claude Code CLI 是运行时依赖（broker
+# spawn 它），但不是 MCP 工具依赖。
+dependencies:
+  tools: []

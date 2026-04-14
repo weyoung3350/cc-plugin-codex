@@ -6,12 +6,22 @@
 
 ## 当前状态
 
-🏗 **Phase 1 完成**：MCP 握手 + `claude_health` 可用；其余工具为 stub，按设计分阶段落地。
+🚀 **Phase 1-7 完成**（功能 + 文档落地）；Phase 8（回归 fixture / CI）剩。
 
-- 经过 11 轮跨模型设计评审，零 Critical 落地方案：[需求文档](./docs/REQUIREMENTS.md) · [设计文档 v8b](./docs/DESIGN.md)
+| Phase | 范围 | 状态 |
+|-------|------|------|
+| 1 | MCP server 骨架 + `claude_health` | ✅ |
+| 2 | 同步 `claude_ask` / `claude_review`（含 `--json-schema`） | ✅ |
+| 3 | session 串行锁（mkdir + pid/lstart 双因子 stale reclaim） | ✅ |
+| 4 | `claude_task` 同步 + 两级权限 + writes ACK 硬约束 | ✅ |
+| 5 | 后台 worker + `claude_job_get` + `claude_cancel` + orphan sweep | ✅ |
+| 6 | 3 个 SKILL.md（delegation-runtime / result-handling / prompting） | ✅ |
+| 7 | marketplace agent yaml + 用户文档 + license | ✅ |
+| 8 | fake-claude-fixture + 21 checkpoint 自动化回归 | ⏳ |
+
+- 设计：[需求文档](./docs/REQUIREMENTS.md) · [设计文档 v8b](./docs/DESIGN.md)（11 轮跨模型评审，零 Critical 落地）
 - 每个实现任务都走 **实现 → Codex 评审 → 修 Critical → 复核** 循环
-- 单元测试 74/74 通过；本地 MCP 冒烟已验证 Codex ↔ broker 握手
-- 后续阶段：Phase 2（同步 ask/review）、Phase 3（session 串行）、Phase 4（task 权限分级）、Phase 5（后台作业）、Phase 6（skills）、Phase 7（marketplace/文档）、Phase 8（回归 fixture）
+- **219 个单元测试全绿**；订阅 OAuth 端到端冒烟已通过
 
 ## 设计亮点
 
@@ -25,14 +35,24 @@
 
 ## MCP 工具（Codex 模型可见）
 
-| 工具 | 用途 |
-|------|------|
-| `claude_health` | 探测 Claude 安装 / 认证 / `--bare` 兼容性 |
-| `claude_ask` | 自由提问（默认只读） |
-| `claude_review` | 结构化代码审查（`--json-schema` 输出） |
-| `claude_task` | 委托编辑任务（`plan` / `writes` 两级权限） |
-| `claude_job_get` | 查询后台作业状态 / 分页读日志 |
-| `claude_cancel` | 取消后台作业 |
+| 工具 | 同步/异步 | 用途 |
+|------|----------|------|
+| `claude_health` | 同步 | 探测 Claude 安装 / 认证（OAuth/env/helper）/ 平台兼容性 |
+| `claude_ask` | 同步 | 自由提问（默认 plan 模式只读：Read/Grep/Glob） |
+| `claude_review` | 同步 | 结构化代码审查（固定 JSON schema） |
+| `claude_task` | 同步/后台 | 委托编辑任务（`plan` / `writes` 两级权限）；`background:true` 起 detached worker |
+| `claude_job_get` | 同步 | 查询后台作业状态 / 分页读 output.log（base64 编码） |
+| `claude_cancel` | 同步 | 取消后台作业（SIGTERM → 10s grace → SIGKILL，含 pid identity 重校验） |
+
+详细参数 / 调用决策 / 错误码表见 [`plugins/cc/skills/claude-delegation-runtime/SKILL.md`](./plugins/cc/skills/claude-delegation-runtime/SKILL.md)。
+
+## 安装（本地）
+
+```bash
+codex mcp add claude-code -- node /path/to/cc-plugin-codex/plugins/cc/scripts/claude-broker.mjs
+```
+
+之后任何 Codex 会话都可让模型用本插件。卸载：`codex mcp remove claude-code && rm -rf ~/.local/state/cc-plugin-codex`
 
 ## 前置
 
