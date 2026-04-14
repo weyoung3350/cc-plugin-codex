@@ -13,6 +13,7 @@ import {
   _setCached,
 } from "../plugins/cc/scripts/lib/health.mjs";
 import { _internals as runInternals } from "../plugins/cc/scripts/lib/claude-run.mjs";
+import { ackFlagExists } from "../plugins/cc/scripts/lib/workspace.mjs";
 
 const ORIG_SPAWN = healthInternals.spawnSync;
 const ORIG_READ_SETTINGS = healthInternals.readSettings;
@@ -265,7 +266,7 @@ test("broker: claude_health refresh=true re-runs probe", async () => {
   }
 });
 
-test("broker: stub tool (claude_task) returns not-implemented when health is OK", async () => {
+test("broker: stub tool (claude_job_get) returns not-implemented when health is OK", async () => {
   try {
     mockHealthHappy();
     const server = buildBroker();
@@ -282,7 +283,7 @@ test("broker: stub tool (claude_task) returns not-implemented when health is OK"
         jsonrpc: "2.0",
         id: 2,
         method: "tools/call",
-        params: { name: "claude_task", arguments: { task: "do x" } },
+        params: { name: "claude_job_get", arguments: { job_id: "x" } },
       });
       const resp = await nextMessage();
       assert.equal(resp.result.isError, true);
@@ -952,6 +953,309 @@ test("broker: total timeout budget is shared across lock-wait + run phases", asy
       assert.equal(parsed.phase, "run");
     } finally {
       close();
+    }
+  } finally {
+    restoreEnv();
+  }
+});
+
+test("broker: claude_task gates on health BEFORE writing ack flag", async () => {
+  try {
+    setupScratchStateDir();
+    mockHealthNotInstalled();
+    const wsTmp = fs.realpathSync(
+      fs.mkdtempSync(path.join(os.tmpdir(), "ccpc-healthgate-")),
+    );
+    const origCwd = process.cwd();
+    process.chdir(wsTmp);
+    try {
+      const server = buildBroker();
+      const { send, nextMessage, close } = startHarness(server);
+      try {
+        send({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: { protocolVersion: "2024-11-05" },
+        });
+        await nextMessage();
+        send({
+          jsonrpc: "2.0",
+          id: 2,
+          method: "tools/call",
+          params: {
+            name: "claude_task",
+            arguments: {
+              task: "x",
+              allow_writes: true,
+              writes_acknowledged: true,
+            },
+          },
+        });
+        const resp = await nextMessage();
+        assert.equal(resp.result.isError, true);
+        const parsed = JSON.parse(resp.result.content[0].text);
+        assert.equal(parsed.error, "not-installed");
+        // Critical: ack flag MUST NOT have been written when health failed.
+        assert.equal(
+          ackFlagExists(wsTmp),
+          false,
+          "health failure must precede ack flag write",
+        );
+      } finally {
+        close();
+      }
+    } finally {
+      process.chdir(origCwd);
+      fs.rmSync(wsTmp, { recursive: true, force: true });
+    }
+  } finally {
+    restoreEnv();
+  }
+});
+
+test("broker: claude_task files[] are appended to the prompt as 'Focus files:'", async () => {
+  try {
+    setupScratchStateDir();
+    mockHealthHappy();
+    /** @type {string[][]} */
+    const argvSeen = [];
+    /** @type {string[]} */
+    const stdinSeen = [];
+    runInternals.spawn = (bin, argv) => {
+      argvSeen.push(argv);
+      const env = JSON.stringify({ type: "result", result: "done" });
+      const f = fakeRunChild({ stdout: env, exitCode: 0 });
+      // Capture what claude-run wrote to stdin so we can assert prompt body.
+      let buf = "";
+      f.stdin.on("data", (c) => {
+        buf += c.toString("utf8");
+      });
+      f.stdin.on("end", () => {
+        stdinSeen.push(buf);
+      });
+      return f;
+    };
+    const server = buildBroker();
+    const { send, nextMessage, close } = startHarness(server);
+    try {
+      send({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2024-11-05" },
+      });
+      await nextMessage();
+      send({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: {
+          name: "claude_task",
+          arguments: {
+            task: "rename foo to bar",
+            files: ["src/foo.ts", "src/bar.ts"],
+          },
+        },
+      });
+      const resp = await nextMessage();
+      assert.equal(resp.result.isError, false);
+      assert.equal(stdinSeen.length, 1);
+      assert.match(stdinSeen[0], /rename foo to bar/);
+      assert.match(stdinSeen[0], /Focus files:/);
+      assert.match(stdinSeen[0], /- src\/foo\.ts/);
+      assert.match(stdinSeen[0], /- src\/bar\.ts/);
+    } finally {
+      close();
+    }
+  } finally {
+    restoreEnv();
+  }
+});
+
+test("broker: claude_task default mode is plan (read-only flags)", async () => {
+  try {
+    setupScratchStateDir();
+    mockHealthHappy();
+    /** @type {string[][]} */
+    const argvSeen = [];
+    runInternals.spawn = (bin, argv) => {
+      argvSeen.push(argv);
+      const env = JSON.stringify({ type: "result", result: "done" });
+      return fakeRunChild({ stdout: env, exitCode: 0 });
+    };
+    const server = buildBroker();
+    const { send, nextMessage, close } = startHarness(server);
+    try {
+      send({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2024-11-05" },
+      });
+      await nextMessage();
+      send({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: {
+          name: "claude_task",
+          arguments: { task: "list files" },
+        },
+      });
+      const resp = await nextMessage();
+      assert.equal(resp.result.isError, false);
+      const argv = argvSeen[0];
+      // Plan-mode flag set: no acceptEdits, no Edit/Write tools.
+      assert.ok(argv.includes("--permission-mode=plan"));
+      const toolsIdx = argv.indexOf("--tools");
+      assert.equal(argv[toolsIdx + 1], "Read,Grep,Glob");
+    } finally {
+      close();
+    }
+  } finally {
+    restoreEnv();
+  }
+});
+
+test("broker: claude_task allow_writes=true without ack returns writes-need-acknowledgement", async () => {
+  try {
+    setupScratchStateDir();
+    mockHealthHappy();
+    runInternals.spawn = () => {
+      throw new Error("must not spawn — gate should block");
+    };
+    // Make detectWorkspaceRoot return a per-test scratch dir so the ack
+    // flag we install doesn't leak.
+    const wsTmp = fs.realpathSync(
+      fs.mkdtempSync(path.join(os.tmpdir(), "ccpc-ackgate-")),
+    );
+    const origCwd = process.cwd();
+    process.chdir(wsTmp);
+    try {
+      const server = buildBroker();
+      const { send, nextMessage, close } = startHarness(server);
+      try {
+        send({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: { protocolVersion: "2024-11-05" },
+        });
+        await nextMessage();
+        send({
+          jsonrpc: "2.0",
+          id: 2,
+          method: "tools/call",
+          params: {
+            name: "claude_task",
+            arguments: { task: "edit foo.ts", allow_writes: true },
+          },
+        });
+        const resp = await nextMessage();
+        assert.equal(resp.result.isError, true);
+        const parsed = JSON.parse(resp.result.content[0].text);
+        assert.equal(parsed.error, "writes-need-acknowledgement");
+        // Hint must contain the verbatim warning template.
+        assert.match(parsed.hint, /writes_acknowledged/);
+        assert.match(parsed.hint, /Codex approval/);
+        // Flag should NOT have been written yet.
+        assert.equal(
+          ackFlagExists(wsTmp),
+          false,
+        );
+      } finally {
+        close();
+      }
+    } finally {
+      process.chdir(origCwd);
+      fs.rmSync(wsTmp, { recursive: true, force: true });
+    }
+  } finally {
+    restoreEnv();
+  }
+});
+
+test("broker: claude_task allow_writes + writes_acknowledged installs flag and proceeds", async () => {
+  try {
+    setupScratchStateDir();
+    mockHealthHappy();
+    /** @type {string[][]} */
+    const argvSeen = [];
+    runInternals.spawn = (bin, argv) => {
+      argvSeen.push(argv);
+      const env = JSON.stringify({ type: "result", result: "done" });
+      return fakeRunChild({ stdout: env, exitCode: 0 });
+    };
+    const wsTmp = fs.realpathSync(
+      fs.mkdtempSync(path.join(os.tmpdir(), "ccpc-ackok-")),
+    );
+    const origCwd = process.cwd();
+    process.chdir(wsTmp);
+    try {
+      const server = buildBroker();
+      const { send, nextMessage, close } = startHarness(server);
+      try {
+        send({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: { protocolVersion: "2024-11-05" },
+        });
+        await nextMessage();
+        send({
+          jsonrpc: "2.0",
+          id: 2,
+          method: "tools/call",
+          params: {
+            name: "claude_task",
+            arguments: {
+              task: "edit foo.ts",
+              allow_writes: true,
+              writes_acknowledged: true,
+            },
+          },
+        });
+        const resp = await nextMessage();
+        assert.equal(resp.result.isError, false);
+        // Flag now exists in workspace.
+        assert.equal(
+          ackFlagExists(wsTmp),
+          true,
+        );
+        // Argv has writes-mode flags.
+        const argv = argvSeen[0];
+        assert.ok(argv.includes("--permission-mode=acceptEdits"));
+        const toolsIdx = argv.indexOf("--tools");
+        assert.equal(argv[toolsIdx + 1], "Read,Edit,Write,Grep,Glob");
+
+        // Second call with allow_writes:true but NO writes_acknowledged
+        // should now succeed (flag already installed = sticky) AND still
+        // route through writes-mode flags, not silently degrade to plan.
+        send({
+          jsonrpc: "2.0",
+          id: 3,
+          method: "tools/call",
+          params: {
+            name: "claude_task",
+            arguments: { task: "edit bar.ts", allow_writes: true },
+          },
+        });
+        const resp2 = await nextMessage();
+        assert.equal(resp2.result.isError, false);
+        const argv2 = argvSeen[1];
+        assert.ok(
+          argv2.includes("--permission-mode=acceptEdits"),
+          "second sticky call must still be writes-mode",
+        );
+        const tools2Idx = argv2.indexOf("--tools");
+        assert.equal(argv2[tools2Idx + 1], "Read,Edit,Write,Grep,Glob");
+      } finally {
+        close();
+      }
+    } finally {
+      process.chdir(origCwd);
+      fs.rmSync(wsTmp, { recursive: true, force: true });
     }
   } finally {
     restoreEnv();

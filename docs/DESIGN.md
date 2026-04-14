@@ -73,7 +73,7 @@ Codex CLI
 | 作业状态 | `$STATE_DIR/jobs/<job_id>/state.json` | worker（tmp+rename 原子写） | 不可见 |
 | 作业日志 | `$STATE_DIR/jobs/<job_id>/output.log` | worker | 不可见 |
 | health 缓存（进程内） | 无盘文件 | broker | 不可见 |
-| **workspace ack flag** | `<workspace_root>/.cc-plugin-codex/allow_writes_acknowledged.flag` | broker | 仅用户显式 `add_dirs` 包含 workspace_root 时 Claude 可见；内部不存放任何其他数据 |
+| **per-workspace ack flag** | `$STATE_DIR/ack/<sha256(workspace_root)[:16]>.json` | broker | 不可见（在 $STATE_DIR 下）。早期设计曾放在 workspace 内 `.cc-plugin-codex/`，但那允许仓库内预置文件绕过 ack 硬约束，故迁移到 $STATE_DIR |
 | 用户开放目录 | `add_dirs[]`（调用方传入） | Claude | 可读写（按权限级别） |
 
 **注**：`workspace_root` 通过 `realpath(git rev-parse --show-toplevel 2>/dev/null || cwd)` 归一化；符号链接/嵌套 submodule 都以 realpath 为准，避免重复 ack。workspace 子目录用 `.cc-plugin-codex/`（仅存 ack flag，不存其他任何状态）。
@@ -276,7 +276,7 @@ spawnSync('ps', ['-o', 'lstart=', '-p', String(pid)], { env: { ...process.env, L
   - **后台工具**（`claude_task(background=true)`）：`timeout_sec` 语义是 **worker 运行总预算**（从 worker 拿锁 + 运行 claude + 清理，整体上限）；broker 侧"提交作业" <1s 不计入。worker 自己维护定时器；超时 SIGTERM claude process group，`child.on('exit', (code, signal) => finalizeJobIfNonTerminal(..., {state: "failed", exit_code: null, exit_signal: signal, error: "timeout"}))`（见因果矩阵）
   - 超时响应统一 `{error: "timeout", phase, partial_text?, captured_bytes}`（同步）或 `state: "failed", error: "timeout"`（后台）
 - **Health 缓存语义**：broker 进程启动时执行一次 health check，结果写入进程内 `healthState`。所有非 `claude_health` 工具入口**强校验** `healthState.installed && healthState.authenticated && healthState.platform_supported`，失败直接返回 `{error: "auth-required" | "not-installed" | "platform-unsupported", hint}`。`claude_health({refresh: true})` 可手动重探。TTL 不做自动过期（用户显式刷新）。
-- **`allow_writes` 轻量硬约束（workspace 作用域）**：flag 路径 `<workspace_root>/.cc-plugin-codex/allow_writes_acknowledged.flag`（见路径总表，workspace_root 经 realpath 归一化）。首次 `claude_task(allow_writes: true)` 必须同传 `writes_acknowledged: true`；flag 不存在且 `writes_acknowledged` 缺失 → `{error: "writes-need-acknowledgement", hint: "...固定模板..."}`；确认后原子写 flag，后续免再传
+- **`allow_writes` 轻量硬约束（workspace 作用域）**：flag 存放于 `$STATE_DIR/ack/<sha256(workspace_root)[:16]>.json`（见路径总表）。`workspace_root` 由 `git rev-parse --show-toplevel || cwd` + realpath 归一化得到；同名 hash slot 内必须含 JSON 且 `workspace_root` 字段与请求的 root 一致才生效（防 hash 碰撞或外部写入）。首次 `claude_task(allow_writes: true)` 必须同传 `writes_acknowledged: true`；flag 不存在且 `writes_acknowledged` 缺失 → `{error: "writes-need-acknowledgement", hint: "...固定模板..."}`；确认后用 `link(2)` 原子写入（并发安全幂等），后续同 workspace 调用免再传
 - **review schema 固定**：`claude_review` 不接受调用方覆盖 schema，避免多版本兼容
 - **`claude_cancel` 仅 job_id**：同步工具不可取消，但有 `timeout_sec` 兜底
 - **`claude_job_get` 分页契约**：`output_offset` 默认 0，`output_limit` 默认 65536；`eof=true` 表示作业已结束且 `offset >= total_bytes`

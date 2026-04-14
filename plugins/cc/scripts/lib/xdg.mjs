@@ -10,6 +10,7 @@
 import os from "node:os";
 import path from "node:path";
 import { realpathSync } from "node:fs";
+import { createHash } from "node:crypto";
 
 const APP_NAME = "cc-plugin-codex";
 
@@ -94,9 +95,20 @@ export function jobDir(jobId) {
 }
 
 /**
- * Path to the workspace-scoped acknowledgement flag for `allow_writes=true`.
- * Lives under <workspace_root>/.cc-plugin-codex/allow_writes_acknowledged.flag.
- * Caller is responsible for normalising workspace_root via realpath.
+ * Path to the per-workspace acknowledgement flag for `allow_writes=true`.
+ *
+ * Lives under `$STATE_DIR/ack/<sha256(workspace_root)[:16]>.json`, NOT
+ * inside the workspace itself. This is intentional: storing it inside the
+ * workspace would let anyone pre-create or commit
+ * `.cc-plugin-codex/allow_writes_acknowledged.flag` to bypass the gate
+ * permanently. By keeping ack state in $STATE_DIR (which we never expose
+ * to Claude — see isUnderStateDir), only the broker can create or remove
+ * it, and the contract "first allow_writes:true requires explicit ack"
+ * actually holds.
+ *
+ * The hash key — rather than the literal path — keeps file names short
+ * and avoids leaking workspace paths via state-dir listings; the JSON
+ * payload still records the original workspace_root for diagnostics.
  *
  * @param {string} workspaceRoot  Absolute, already-realpath'd workspace root.
  * @returns {string}
@@ -107,11 +119,8 @@ export function ackFlagPath(workspaceRoot) {
       `ackFlagPath requires an absolute workspaceRoot, got: ${workspaceRoot}`,
     );
   }
-  return path.join(
-    workspaceRoot,
-    ".cc-plugin-codex",
-    "allow_writes_acknowledged.flag",
-  );
+  const key = createHash("sha256").update(workspaceRoot).digest("hex").slice(0, 16);
+  return path.join(stateRoot(), "ack", `${key}.json`);
 }
 
 /**

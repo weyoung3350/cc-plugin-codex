@@ -116,11 +116,22 @@ test("sessionLockPath / jobDir: ID validation", () => {
   }
 });
 
-test("ackFlagPath: workspaceRoot must be absolute", () => {
-  assert.equal(
-    ackFlagPath("/repo/foo"),
-    "/repo/foo/.cc-plugin-codex/allow_writes_acknowledged.flag",
-  );
+test("ackFlagPath: lives under $STATE_DIR/ack/<hash>.json", () => {
+  try {
+    process.env.CC_PLUGIN_CODEX_STATE_DIR = "/state";
+    const flag = ackFlagPath("/repo/foo");
+    assert.ok(flag.startsWith("/state/ack/"));
+    assert.ok(flag.endsWith(".json"));
+    // Different workspace root → different hash → different path.
+    assert.notEqual(flag, ackFlagPath("/repo/bar"));
+    // Same root → same path (deterministic hash).
+    assert.equal(flag, ackFlagPath("/repo/foo"));
+  } finally {
+    restoreEnv();
+  }
+});
+
+test("ackFlagPath: rejects non-absolute workspaceRoot", () => {
   assert.throws(() => ackFlagPath("relative/workspace"), /absolute/);
 });
 

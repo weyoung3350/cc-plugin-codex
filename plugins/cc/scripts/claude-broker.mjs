@@ -35,8 +35,23 @@ import {
   release as releaseSessionLock,
   SessionLockError,
 } from "./lib/session-lock.mjs";
+import {
+  detectWorkspaceRoot,
+  ackFlagExists,
+  writeAckFlag,
+} from "./lib/workspace.mjs";
 
 import { randomUUID } from "node:crypto";
+
+// Fixed acknowledgement template — emitted verbatim on the first
+// allow_writes=true request so the Codex model surfaces a consistent
+// warning to the user. Matches DESIGN.md "allow_writes 硬约束".
+const WRITES_ACK_TEMPLATE = [
+  "⚠️ 这是当前 workspace 第一次请求 claude_task 写入权限。",
+  "Claude 在 writes 模式下可以编辑 / 创建文件，且**不经 Codex approval 流程**。",
+  "请先和用户确认；用户同意后，重新调用本工具并加上 writes_acknowledged: true 即可继续。",
+  "确认后，本 workspace 后续 claude_task(allow_writes:true) 调用将免去再确认。",
+].join("\n");
 
 const SERVER_NAME = "cc-plugin-codex";
 const SERVER_VERSION = "0.0.1";
@@ -453,13 +468,102 @@ export function buildBroker() {
     },
   });
 
+  // --- claude_task (Phase 4, sync only — background lands in Phase 5) ----
+  server.registerTool({
+    name: "claude_task",
+    description:
+      "把编辑任务委托给 Claude（同步）。默认 plan 模式只读；allow_writes:true 切到 writes 模式（acceptEdits + Read/Edit/Write/Grep/Glob）。首次写入需同时传 writes_acknowledged:true，broker 会在 $STATE_DIR/ack/ 下记录该 workspace 已确认，后续同 workspace 的调用免确认。返回 {text, session_id, session_persisted, cost_usd, duration_ms, truncated, captured_bytes, total_bytes}。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        task: { type: "string", minLength: 1 },
+        files: { type: "array", items: { type: "string" } },
+        session_id: { type: "string" },
+        allow_writes: { type: "boolean" },
+        writes_acknowledged: { type: "boolean" },
+        timeout_sec: { type: "integer", minimum: 1, maximum: 1800 },
+        add_dirs: { type: "array", items: { type: "string" } },
+      },
+      required: ["task"],
+      additionalProperties: false,
+    },
+    handler: async (args) => {
+      if (typeof args?.task !== "string" || args.task.length === 0) {
+        return toolErrorResult(
+          "invalid-task",
+          "claude_task: task must be a non-empty string",
+        );
+      }
+      // Health gate FIRST — must precede every side effect (including
+      // writing the workspace ack flag), per DESIGN.md "认证前置".
+      try {
+        assertHealthy();
+      } catch (err) {
+        if (err instanceof HealthError) return healthErrorToolResult(err);
+        throw err;
+      }
+      const allowWrites = args.allow_writes === true;
+      let permission = /** @type {"plan" | "writes"} */ ("plan");
+      if (allowWrites) {
+        // Writes ack gate. Per-workspace, lifelong sticky flag.
+        let workspaceRoot;
+        try {
+          workspaceRoot = detectWorkspaceRoot(process.cwd());
+        } catch (err) {
+          return toolErrorResult(
+            "workspace-detect-failed",
+            err instanceof Error ? err.message : String(err),
+          );
+        }
+        if (!ackFlagExists(workspaceRoot)) {
+          if (args.writes_acknowledged !== true) {
+            return toolErrorResult(
+              "writes-need-acknowledgement",
+              WRITES_ACK_TEMPLATE,
+              { workspace_root: workspaceRoot },
+            );
+          }
+          // Caller has acknowledged → install the flag and proceed.
+          try {
+            writeAckFlag(workspaceRoot);
+          } catch (err) {
+            return toolErrorResult(
+              "writes-ack-write-failed",
+              err instanceof Error ? err.message : String(err),
+              { workspace_root: workspaceRoot },
+            );
+          }
+        }
+        permission = "writes";
+      }
+
+      // Compose the prompt: prepend a short instruction listing the files
+      // Claude should focus on, if any. The actual edit decisions stay
+      // with Claude.
+      const lines = [args.task];
+      if (Array.isArray(args.files) && args.files.length > 0) {
+        const cleanFiles = args.files.filter(
+          (f) => typeof f === "string" && f.length > 0,
+        );
+        if (cleanFiles.length > 0) {
+          lines.push("");
+          lines.push("Focus files:");
+          for (const f of cleanFiles) lines.push(`  - ${f}`);
+        }
+      }
+      const prompt = lines.join("\n");
+
+      return runSyncTool("claude_task", permission, null, {
+        prompt,
+        session_id: args.session_id,
+        add_dirs: args.add_dirs,
+        timeout_sec: args.timeout_sec,
+      });
+    },
+  });
+
   // --- stubs for upcoming phases -------------------------------------------
   const stubTools = [
-    {
-      name: "claude_task",
-      description:
-        "把编辑任务委托给 Claude。支持 allow_writes 开启写入权限和 background 后台执行。完整实现将在 Phase 4-5 落地；当前为占位。",
-    },
     {
       name: "claude_job_get",
       description:
