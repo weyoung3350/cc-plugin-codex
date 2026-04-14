@@ -1,0 +1,11 @@
+node_modules/
+*.log
+.DS_Store
+.cc-plugin-codex/
+.cc-plugin-data/
+plugins/cc/.generated/
+dist/
+coverage/
+*.tsbuildinfo
+.env
+.env.local
