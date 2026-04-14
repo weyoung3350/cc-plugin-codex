@@ -7,7 +7,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { buildBroker, isDirectInvocation } from "../plugins/cc/scripts/claude-broker.mjs";
+import {
+  buildBroker,
+  isDirectInvocation,
+  sweepOrphanedJobs,
+} from "../plugins/cc/scripts/claude-broker.mjs";
 import {
   _internals as healthInternals,
   _setCached,
@@ -266,8 +270,9 @@ test("broker: claude_health refresh=true re-runs probe", async () => {
   }
 });
 
-test("broker: stub tool (claude_job_get) returns not-implemented when health is OK", async () => {
+test("broker: claude_job_get returns job-not-found for unknown id", async () => {
   try {
+    setupScratchStateDir();
     mockHealthHappy();
     const server = buildBroker();
     const { send, nextMessage, close } = startHarness(server);
@@ -283,12 +288,12 @@ test("broker: stub tool (claude_job_get) returns not-implemented when health is 
         jsonrpc: "2.0",
         id: 2,
         method: "tools/call",
-        params: { name: "claude_job_get", arguments: { job_id: "x" } },
+        params: { name: "claude_job_get", arguments: { job_id: "ghost" } },
       });
       const resp = await nextMessage();
       assert.equal(resp.result.isError, true);
       const parsed = JSON.parse(resp.result.content[0].text);
-      assert.equal(parsed.error, "not-implemented");
+      assert.equal(parsed.error, "job-not-found");
     } finally {
       close();
     }
@@ -1371,6 +1376,335 @@ test("broker: one-shot calls (no session_id) do NOT serialise", async () => {
     } finally {
       close();
     }
+  } finally {
+    restoreEnv();
+  }
+});
+
+test("broker: claude_task(background:true) returns job_id and forks a worker", async () => {
+  // Real subprocess test — uses node's child_process to spawn the worker
+  // script, which in turn would normally spawn `claude`. We can't mock the
+  // detached worker's internal spawn from the broker tests, so we rely on
+  // claude not being installed → worker finalises spawn-failed quickly.
+  // What we DO assert: broker returns a job_id + worker_pid + log_path,
+  // the job dir is created, and within ~5s the job lands in a terminal
+  // state (succeeded / failed) — proving the worker actually ran and
+  // updated state.json.
+  try {
+    setupScratchStateDir();
+    mockHealthHappy();
+    const server = buildBroker();
+    const { send, nextMessage, close } = startHarness(server);
+    try {
+      send({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2024-11-05" },
+      });
+      await nextMessage();
+      send({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: {
+          name: "claude_task",
+          arguments: { task: "noop", background: true },
+        },
+      });
+      const resp = await nextMessage(5000);
+      assert.equal(resp.result.isError, false);
+      const parsed = JSON.parse(resp.result.content[0].text);
+      assert.equal(typeof parsed.job_id, "string");
+      assert.equal(typeof parsed.worker_pid, "number");
+      assert.match(parsed.log_path, /output\.log$/);
+      // Wait for terminal state.
+      const job_id = parsed.job_id;
+      let state = null;
+      for (let i = 0; i < 30; i += 1) {
+        send({
+          jsonrpc: "2.0",
+          id: 100 + i,
+          method: "tools/call",
+          params: { name: "claude_job_get", arguments: { job_id } },
+        });
+        const r = await nextMessage(3000);
+        const got = JSON.parse(r.result.content[0].text);
+        state = got.state;
+        if (["succeeded", "failed", "cancelled"].includes(state)) break;
+        await new Promise((r2) => setTimeout(r2, 200));
+      }
+      assert.ok(
+        ["succeeded", "failed", "cancelled"].includes(state),
+        `expected terminal state, got ${state}`,
+      );
+    } finally {
+      close();
+    }
+  } finally {
+    restoreEnv();
+  }
+});
+
+test("broker: claude_job_get with wait:true blocks until terminal", async () => {
+  try {
+    setupScratchStateDir();
+    mockHealthHappy();
+    const server = buildBroker();
+    const { send, nextMessage, close } = startHarness(server);
+    try {
+      send({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2024-11-05" },
+      });
+      await nextMessage();
+      send({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: {
+          name: "claude_task",
+          arguments: { task: "noop", background: true },
+        },
+      });
+      const launch = await nextMessage(5000);
+      const { job_id } = JSON.parse(launch.result.content[0].text);
+      send({
+        jsonrpc: "2.0",
+        id: 3,
+        method: "tools/call",
+        params: {
+          name: "claude_job_get",
+          arguments: { job_id, wait: true, wait_timeout_sec: 10 },
+        },
+      });
+      const r = await nextMessage(15000);
+      const got = JSON.parse(r.result.content[0].text);
+      assert.ok(["succeeded", "failed", "cancelled"].includes(got.state));
+      assert.equal(got.output.encoding, "base64");
+      assert.equal(got.output.eof, true);
+    } finally {
+      close();
+    }
+  } finally {
+    restoreEnv();
+  }
+});
+
+test("broker: claude_cancel on unknown job returns not-found", async () => {
+  try {
+    setupScratchStateDir();
+    mockHealthHappy();
+    const server = buildBroker();
+    const { send, nextMessage, close } = startHarness(server);
+    try {
+      send({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2024-11-05" },
+      });
+      await nextMessage();
+      send({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: { name: "claude_cancel", arguments: { job_id: "ghost" } },
+      });
+      const r = await nextMessage();
+      const parsed = JSON.parse(r.result.content[0].text);
+      assert.equal(parsed.cancelled, false);
+      assert.equal(parsed.reason, "not-found");
+    } finally {
+      close();
+    }
+  } finally {
+    restoreEnv();
+  }
+});
+
+test("broker: claude_cancel on terminal job returns already-done", async () => {
+  try {
+    setupScratchStateDir();
+    mockHealthHappy();
+    const server = buildBroker();
+    const { send, nextMessage, close } = startHarness(server);
+    try {
+      send({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2024-11-05" },
+      });
+      await nextMessage();
+      // Launch + wait for terminal.
+      send({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: {
+          name: "claude_task",
+          arguments: { task: "noop", background: true },
+        },
+      });
+      const launch = await nextMessage(5000);
+      const { job_id } = JSON.parse(launch.result.content[0].text);
+      send({
+        jsonrpc: "2.0",
+        id: 3,
+        method: "tools/call",
+        params: {
+          name: "claude_job_get",
+          arguments: { job_id, wait: true, wait_timeout_sec: 10 },
+        },
+      });
+      await nextMessage(15000);
+      // Now cancel: should be already-done.
+      send({
+        jsonrpc: "2.0",
+        id: 4,
+        method: "tools/call",
+        params: { name: "claude_cancel", arguments: { job_id } },
+      });
+      const r = await nextMessage();
+      const parsed = JSON.parse(r.result.content[0].text);
+      assert.equal(parsed.cancelled, false);
+      assert.equal(parsed.reason, "already-done");
+    } finally {
+      close();
+    }
+  } finally {
+    restoreEnv();
+  }
+});
+
+test("sweepOrphanedJobs: queued job with dead worker_pid → marked orphaned", async () => {
+  try {
+    setupScratchStateDir();
+    // Plant a queued job with a long-dead worker_pid (very large pid that
+    // doesn't exist on this machine).
+    const jobsRoot = path.join(activeScratchDir, "jobs");
+    fs.mkdirSync(path.join(jobsRoot, "ghost"), { recursive: true });
+    fs.writeFileSync(
+      path.join(jobsRoot, "ghost", "state.json"),
+      JSON.stringify({
+        job_id: "ghost",
+        state: "queued",
+        session_id: null,
+        session_persisted: false,
+        worker_pid: 2_147_483_640,
+        worker_lstart_raw: "Mon Jan  1 00:00:00 2000",
+        claude_pid: null,
+        claude_lstart_raw: null,
+        cancel_requested: false,
+        created_at_ms: 1,
+        started_at_ms: null,
+        ended_at_ms: null,
+        exit_code: null,
+        exit_signal: null,
+        error: null,
+        output_bytes: 0,
+      }),
+    );
+    await sweepOrphanedJobs();
+    const final = JSON.parse(
+      fs.readFileSync(path.join(jobsRoot, "ghost", "state.json"), "utf8"),
+    );
+    assert.equal(final.state, "failed");
+    assert.equal(final.error, "orphaned");
+    assert.ok(Number.isFinite(final.ended_at_ms));
+  } finally {
+    restoreEnv();
+  }
+});
+
+test("sweepOrphanedJobs: terminal jobs are NEVER touched", async () => {
+  try {
+    setupScratchStateDir();
+    const jobsRoot = path.join(activeScratchDir, "jobs");
+    fs.mkdirSync(path.join(jobsRoot, "done"), { recursive: true });
+    const before = {
+      job_id: "done",
+      state: "succeeded",
+      session_id: null,
+      session_persisted: false,
+      worker_pid: 2_147_483_640,
+      worker_lstart_raw: "x",
+      claude_pid: 2_147_483_641,
+      claude_lstart_raw: "y",
+      cancel_requested: false,
+      created_at_ms: 1,
+      started_at_ms: 2,
+      ended_at_ms: 3,
+      exit_code: 0,
+      exit_signal: null,
+      error: null,
+      output_bytes: 100,
+    };
+    fs.writeFileSync(
+      path.join(jobsRoot, "done", "state.json"),
+      JSON.stringify(before),
+    );
+    await sweepOrphanedJobs();
+    const after = JSON.parse(
+      fs.readFileSync(path.join(jobsRoot, "done", "state.json"), "utf8"),
+    );
+    assert.deepEqual(after, before);
+  } finally {
+    restoreEnv();
+  }
+});
+
+test("sweepOrphanedJobs: running with claude alive (worker dead) NOT touched", async () => {
+  try {
+    setupScratchStateDir();
+    const jobsRoot = path.join(activeScratchDir, "jobs");
+    fs.mkdirSync(path.join(jobsRoot, "halflive"), { recursive: true });
+    // Use the test runner's own pid + lstart for "claude_pid" so identity
+    // check passes; worker_pid stays clearly dead.
+    const ownLstart = (
+      await import("../plugins/cc/scripts/lib/pid-identity.mjs")
+    ).readLstart(process.pid);
+    fs.writeFileSync(
+      path.join(jobsRoot, "halflive", "state.json"),
+      JSON.stringify({
+        job_id: "halflive",
+        state: "running",
+        session_id: null,
+        session_persisted: false,
+        worker_pid: 2_147_483_640,
+        worker_lstart_raw: "dead",
+        claude_pid: process.pid,
+        claude_lstart_raw: ownLstart,
+        cancel_requested: false,
+        created_at_ms: 1,
+        started_at_ms: 2,
+        ended_at_ms: null,
+        exit_code: null,
+        exit_signal: null,
+        error: null,
+        output_bytes: 0,
+      }),
+    );
+    await sweepOrphanedJobs();
+    const after = JSON.parse(
+      fs.readFileSync(path.join(jobsRoot, "halflive", "state.json"), "utf8"),
+    );
+    // Must remain running because claude is still alive.
+    assert.equal(after.state, "running");
+  } finally {
+    restoreEnv();
+  }
+});
+
+test("sweepOrphanedJobs: empty jobs dir is a no-op", async () => {
+  try {
+    setupScratchStateDir();
+    await sweepOrphanedJobs();
+    // Should not throw; should not create any state.
+    assert.ok(true);
   } finally {
     restoreEnv();
   }

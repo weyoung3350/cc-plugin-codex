@@ -40,8 +40,38 @@ import {
   ackFlagExists,
   writeAckFlag,
 } from "./lib/workspace.mjs";
+import {
+  createJob,
+  readJobState,
+  finalizeJobIfNonTerminal,
+  requestCancel as requestJobCancel,
+  TrackedJobError,
+} from "./lib/tracked-jobs.mjs";
+import { jobDir, jobsDir, sessionsDir } from "./lib/xdg.mjs";
+import { readLstart, sameIdentity, isAlive } from "./lib/pid-identity.mjs";
+
+import { spawn as nodeSpawn } from "node:child_process";
+import { fileURLToPath as _fileURLToPath } from "node:url";
+import {
+  writeFileSync,
+  openSync,
+  closeSync,
+  statSync,
+  readSync,
+  readdirSync,
+} from "node:fs";
 
 import { randomUUID } from "node:crypto";
+
+const WORKER_SCRIPT_PATH = path.resolve(
+  path.dirname(_fileURLToPath(import.meta.url)),
+  "claude-worker.mjs",
+);
+
+// SIGTERM → SIGKILL grace window for claude_cancel(running). Matches DESIGN.md.
+const CANCEL_GRACE_MS = 10_000;
+const CANCEL_KILL_FOLLOWUP_MS = 12_000;
+const JOB_GET_DEFAULT_LIMIT = 65_536;
 
 // Fixed acknowledgement template — emitted verbatim on the first
 // allow_writes=true request so the Codex model surfaces a consistent
@@ -468,11 +498,11 @@ export function buildBroker() {
     },
   });
 
-  // --- claude_task (Phase 4, sync only — background lands in Phase 5) ----
+  // --- claude_task (Phase 4 sync + Phase 5 background) -------------------
   server.registerTool({
     name: "claude_task",
     description:
-      "把编辑任务委托给 Claude（同步）。默认 plan 模式只读；allow_writes:true 切到 writes 模式（acceptEdits + Read/Edit/Write/Grep/Glob）。首次写入需同时传 writes_acknowledged:true，broker 会在 $STATE_DIR/ack/ 下记录该 workspace 已确认，后续同 workspace 的调用免确认。返回 {text, session_id, session_persisted, cost_usd, duration_ms, truncated, captured_bytes, total_bytes}。",
+      "把编辑任务委托给 Claude。默认 plan 模式只读；allow_writes:true 切到 writes 模式。首次写入需 writes_acknowledged:true，broker 在 $STATE_DIR/ack/ 记录该 workspace 已确认。background:true 会 fork 一个独立 worker 进程，立即返回 {job_id, worker_pid, log_path}，用 claude_job_get / claude_cancel 后续管理；不传 background 则同步运行返回 {text, session_id, session_persisted, cost_usd, duration_ms, truncated, captured_bytes, total_bytes}。",
     inputSchema: {
       type: "object",
       properties: {
@@ -481,6 +511,7 @@ export function buildBroker() {
         session_id: { type: "string" },
         allow_writes: { type: "boolean" },
         writes_acknowledged: { type: "boolean" },
+        background: { type: "boolean" },
         timeout_sec: { type: "integer", minimum: 1, maximum: 1800 },
         add_dirs: { type: "array", items: { type: "string" } },
       },
@@ -553,6 +584,16 @@ export function buildBroker() {
       }
       const prompt = lines.join("\n");
 
+      // Background path forks an independent worker and returns the job_id
+      // immediately; sync path runs through runSyncTool.
+      if (args.background === true) {
+        return await launchBackgroundJob({
+          permission,
+          prompt,
+          args,
+        });
+      }
+
       return runSyncTool("claude_task", permission, null, {
         prompt,
         session_id: args.session_id,
@@ -562,70 +603,429 @@ export function buildBroker() {
     },
   });
 
-  // --- stubs for upcoming phases -------------------------------------------
-  const stubTools = [
-    {
-      name: "claude_job_get",
-      description:
-        "读取后台作业的状态和分页日志。完整实现将在 Phase 5 落地；当前为占位。",
-    },
-    {
-      name: "claude_cancel",
-      description:
-        "通过 job_id 取消后台作业。完整实现将在 Phase 5 落地；当前为占位。",
-    },
-  ];
-
-  for (const t of stubTools) {
-    server.registerTool({
-      name: t.name,
-      description: t.description,
-      inputSchema: { type: "object", additionalProperties: true },
-      handler: () => {
-        try {
-          assertHealthy();
-        } catch (err) {
-          return healthErrorToolResult(err);
-        }
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(
-                {
-                  error: "not-implemented",
-                  hint: `${t.name} is a Phase 1 stub; full behaviour arrives in a later phase.`,
-                },
-                null,
-                2,
-              ),
-            },
-          ],
-          isError: true,
-        };
+  // --- claude_job_get (Phase 5) ------------------------------------------
+  server.registerTool({
+    name: "claude_job_get",
+    description:
+      "查询后台作业状态 + 分页读取 output.log（base64 编码避免 UTF-8 边界问题）。返回 {state, exit_code, exit_signal, error, started_at_ms, ended_at_ms, output:{chunk_base64, encoding, returned_bytes, next_offset, total_bytes, eof}}。output_offset/output_limit 默认 0/65536。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        job_id: { type: "string", minLength: 1 },
+        wait: { type: "boolean" },
+        wait_timeout_sec: { type: "integer", minimum: 0, maximum: 1800 },
+        output_offset: { type: "integer", minimum: 0 },
+        output_limit: { type: "integer", minimum: 1, maximum: 1024 * 1024 },
       },
-    });
-  }
+      required: ["job_id"],
+      additionalProperties: false,
+    },
+    handler: async (args) => {
+      try {
+        assertHealthy();
+      } catch (err) {
+        if (err instanceof HealthError) return healthErrorToolResult(err);
+        throw err;
+      }
+      return await readJobReport(args);
+    },
+  });
+
+  // --- claude_cancel (Phase 5) -------------------------------------------
+  server.registerTool({
+    name: "claude_cancel",
+    description:
+      "取消后台作业。queued 阶段写 cancel_requested=true 让 worker 收尾；running 阶段对 claude process group 发 SIGTERM (10s 后 SIGKILL)。终态返回 {cancelled:false, reason:'already-done'}。前台调用不支持取消（同步工具有 timeout_sec 兜底）。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        job_id: { type: "string", minLength: 1 },
+      },
+      required: ["job_id"],
+      additionalProperties: false,
+    },
+    handler: async (args) => {
+      try {
+        assertHealthy();
+      } catch (err) {
+        if (err instanceof HealthError) return healthErrorToolResult(err);
+        throw err;
+      }
+      return await cancelJob(args.job_id);
+    },
+  });
 
   return server;
 }
 
+// ─── Phase 5 helpers ───────────────────────────────────────────────────
+
+/**
+ * Fork a detached worker for claude_task(background:true). Returns an MCP
+ * tool result with {job_id, worker_pid, log_path} on success.
+ */
+async function launchBackgroundJob({ permission, prompt, args }) {
+  const job_id = randomUUID();
+  const cwd = process.cwd();
+  let claudeArgv;
+  try {
+    claudeArgv = buildClaudeFlags({
+      permission,
+      cwd,
+      add_dirs: args.add_dirs,
+      session_id: args.session_id,
+      useResume: true,
+      schema: undefined,
+    });
+  } catch (err) {
+    if (err instanceof PermissionError) {
+      return toolErrorResult(err.reason, err.message);
+    }
+    throw err;
+  }
+
+  const sessionId =
+    typeof args.session_id === "string" && args.session_id.length > 0
+      ? args.session_id
+      : null;
+  const dir = jobDir(job_id);
+
+  // CRASH-SAFE LAUNCH (spawn-first):
+  //
+  //   1. spawn detached worker → worker.pid known
+  //   2. readLstart(worker.pid) → fail-fast if null
+  //   3. createJob(worker_pid, worker_lstart) → state.json now reflects
+  //      the actual worker identity. sweepOrphanedJobs can never produce
+  //      a false-positive orphan against this job, since worker_pid is
+  //      always the real worker pid.
+  //   4. writeFileSync(spec.json) → worker's spec-poll resolves and it
+  //      proceeds. If this step fails, finalize the just-created job so
+  //      we don't leave a queued zombie.
+  //   5. return job_id
+  //
+  // Failure modes:
+  //   - broker crashes between 1 and 3: state.json never created;
+  //     leaked worker polls spec/state, times out, exits silently. Job
+  //     is invisible to the user — acceptable, broker can't even reply.
+  //   - broker crashes between 3 and 4: state.json exists but spec.json
+  //     never appears. Worker times out reading spec, finalises
+  //     spawn-failed.
+  //   - broker crashes after 4: normal flow.
+
+  let worker;
+  try {
+    worker = nodeSpawn(
+      process.execPath,
+      [WORKER_SCRIPT_PATH, job_id],
+      {
+        cwd,
+        detached: true,
+        stdio: "ignore",
+        env: process.env,
+        windowsHide: true,
+      },
+    );
+    if (typeof worker.unref === "function") worker.unref();
+  } catch (err) {
+    return toolErrorResult(
+      "worker-spawn-failed",
+      err instanceof Error ? err.message : String(err),
+    );
+  }
+
+  const workerLstart = readLstart(worker.pid);
+  if (workerLstart === null || workerLstart.length === 0) {
+    try { worker.kill("SIGKILL"); } catch {}
+    return toolErrorResult(
+      "worker-lstart-unreadable",
+      `cannot read process start time for worker pid ${worker.pid}`,
+    );
+  }
+
+  try {
+    createJob({
+      job_id,
+      session_id: sessionId,
+      session_persisted: sessionId !== null,
+      worker_pid: worker.pid,
+      worker_lstart_raw: workerLstart,
+    });
+  } catch (err) {
+    try { worker.kill("SIGKILL"); } catch {}
+    if (err instanceof TrackedJobError) {
+      return toolErrorResult(err.reason, err.message);
+    }
+    throw err;
+  }
+
+  try {
+    writeFileSync(
+      path.join(dir, "spec.json"),
+      JSON.stringify({
+        argv: claudeArgv,
+        prompt,
+        cwd,
+        session_id: sessionId,
+      }),
+    );
+  } catch (err) {
+    // Spec write failed. Kill the worker (it'll either time out reading
+    // spec or never see the file at all) AND finalize the job so we
+    // don't leave a queued zombie that nothing will sweep.
+    try { worker.kill("SIGKILL"); } catch {}
+    await finalizeJobIfNonTerminal(job_id, {
+      state: "failed",
+      error: "spawn-failed",
+      ended_at_ms: Date.now(),
+    }).catch(() => {});
+    return toolErrorResult(
+      "spec-write-failed",
+      err instanceof Error ? err.message : String(err),
+    );
+  }
+
+  return {
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify(
+          {
+            job_id,
+            worker_pid: worker.pid,
+            log_path: path.join(dir, "output.log"),
+          },
+          null,
+          2,
+        ),
+      },
+    ],
+    isError: false,
+  };
+}
+
+/**
+ * Read job state + paginated output for claude_job_get. If wait:true,
+ * polls until the job reaches a terminal state OR wait_timeout_sec.
+ */
+async function readJobReport(args) {
+  const wait = args.wait === true;
+  const waitTimeoutMs =
+    typeof args.wait_timeout_sec === "number"
+      ? args.wait_timeout_sec * 1000
+      : 60_000;
+  const offset = Number.isInteger(args.output_offset)
+    ? args.output_offset
+    : 0;
+  const limit = Number.isInteger(args.output_limit)
+    ? args.output_limit
+    : JOB_GET_DEFAULT_LIMIT;
+
+  const start = Date.now();
+  let state = readJobState(args.job_id);
+  if (!state) {
+    return toolErrorResult("job-not-found", `no job with id ${args.job_id}`);
+  }
+  while (
+    wait &&
+    !["succeeded", "failed", "cancelled"].includes(state.state) &&
+    Date.now() - start < waitTimeoutMs
+  ) {
+    await new Promise((r) => setTimeout(r, 200));
+    const next = readJobState(args.job_id);
+    if (next) state = next;
+  }
+
+  const logPath = path.join(jobDir(args.job_id), "output.log");
+  let totalBytes = 0;
+  try {
+    totalBytes = statSync(logPath).size;
+  } catch {}
+  const sliceStart = Math.max(0, Math.min(offset, totalBytes));
+  const sliceLen = Math.max(0, Math.min(limit, totalBytes - sliceStart));
+  let chunkBase64 = "";
+  let returnedBytes = 0;
+  if (sliceLen > 0) {
+    let fd = null;
+    try {
+      fd = openSync(logPath, "r");
+      const buf = Buffer.allocUnsafe(sliceLen);
+      const n = readSync(fd, buf, 0, sliceLen, sliceStart);
+      returnedBytes = n;
+      chunkBase64 = buf.subarray(0, n).toString("base64");
+    } catch {
+      // fall through — empty slice
+    } finally {
+      if (fd !== null) {
+        try {
+          closeSync(fd);
+        } catch {}
+      }
+    }
+  }
+  const nextOffset = sliceStart + returnedBytes;
+  const eof =
+    ["succeeded", "failed", "cancelled"].includes(state.state) &&
+    nextOffset >= totalBytes;
+
+  return {
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify(
+          {
+            state: state.state,
+            exit_code: state.exit_code,
+            exit_signal: state.exit_signal,
+            error: state.error,
+            cost_usd: null,
+            started_at_ms: state.started_at_ms,
+            ended_at_ms: state.ended_at_ms,
+            cancel_requested: state.cancel_requested,
+            output: {
+              chunk_base64: chunkBase64,
+              encoding: "base64",
+              returned_bytes: returnedBytes,
+              next_offset: nextOffset,
+              total_bytes: totalBytes,
+              eof,
+            },
+          },
+          null,
+          2,
+        ),
+      },
+    ],
+    isError: false,
+  };
+}
+
+/**
+ * Cancel a job. queued → flip cancel_requested, worker observes;
+ * running → SIGTERM the claude process group, 10s grace, then SIGKILL;
+ * terminal → no-op with reason "already-done".
+ */
+async function cancelJob(job_id) {
+  const cur = readJobState(job_id);
+  if (!cur) {
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            { cancelled: false, reason: "not-found" },
+            null,
+            2,
+          ),
+        },
+      ],
+      isError: false,
+    };
+  }
+  if (["succeeded", "failed", "cancelled"].includes(cur.state)) {
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            { cancelled: false, reason: "already-done" },
+            null,
+            2,
+          ),
+        },
+      ],
+      isError: false,
+    };
+  }
+  // Always set the flag so the worker observes it (especially for queued).
+  await requestJobCancel(job_id);
+
+  // Re-read state AFTER setting the flag — it may have raced into a
+  // terminal state, in which case we must report already-done rather
+  // than continuing to signal.
+  const post = readJobState(job_id);
+  if (post && ["succeeded", "failed", "cancelled"].includes(post.state)) {
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            { cancelled: false, reason: "already-done" },
+            null,
+            2,
+          ),
+        },
+      ],
+      isError: false,
+    };
+  }
+
+  // Running: also signal the Claude process group, with identity check.
+  if (
+    post &&
+    post.state === "running" &&
+    post.claude_pid &&
+    post.claude_lstart_raw
+  ) {
+    if (!sameIdentity(post.claude_pid, post.claude_lstart_raw)) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { cancelled: false, reason: "pid-stale" },
+              null,
+              2,
+            ),
+          },
+        ],
+        isError: false,
+      };
+    }
+    const targetPid = post.claude_pid;
+    const targetLstart = post.claude_lstart_raw;
+    try {
+      // Negative pid → process group.
+      process.kill(-targetPid, "SIGTERM");
+    } catch {}
+    // Schedule a follow-up SIGKILL — but RE-VALIDATE identity before
+    // signalling. Within the grace window the original Claude may have
+    // exited and its pid been reused by an unrelated process; SIGKILL
+    // without re-checking would tear that down.
+    setTimeout(() => {
+      if (sameIdentity(targetPid, targetLstart)) {
+        try {
+          process.kill(-targetPid, "SIGKILL");
+        } catch {}
+      }
+    }, CANCEL_GRACE_MS).unref?.();
+  }
+
+  return {
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify(
+          {
+            cancelled: true,
+            phase: (post ?? cur).state,
+          },
+          null,
+          2,
+        ),
+      },
+    ],
+    isError: false,
+  };
+}
+
 /**
  * Main entrypoint: synchronously probe health so the first tool call sees a
- * cached result, then start the MCP server on stdin/stdout. On transport
- * close the process exits with code 0.
- *
- * Startup IS blocked for the duration of the probe (worst case = probe
- * timeout). We accept that to make claude_health deterministic for the
- * first tool call; if that becomes a problem we can hoist the probe into
- * a fire-and-forget that refreshes the cache in the background.
+ * cached result, sweep orphaned jobs, then start the MCP server on
+ * stdin/stdout. On transport close the process exits with code 0.
  */
 export function main() {
   const server = buildBroker();
 
-  // Populate the in-process cache. Failures become warnings in state;
-  // claude_health itself must always remain callable, even when Claude
-  // isn't installed, so we intentionally never abort startup here.
   try {
     probeHealth();
   } catch (err) {
@@ -634,11 +1034,108 @@ export function main() {
     );
   }
 
+  // Sweep orphaned jobs left over from a previous broker session.
+  sweepOrphanedJobs().catch((err) => {
+    process.stderr.write(
+      `[cc-plugin-codex] orphan sweep threw: ${String(err)}\n`,
+    );
+  });
+
   server.start({
     input: process.stdin,
     output: process.stdout,
     onClose: () => process.exit(0),
   });
+}
+
+/**
+ * Tri-state owner classifier mirroring session-lock's reclaim logic. Used
+ * only by sweepOrphanedJobs.
+ *
+ *   "alive"   → kill(0) succeeds AND lstart matches
+ *   "dead"    → kill(0) ESRCH OR pid alive but lstart mismatch (PID reuse)
+ *   "unknown" → pid alive but ps couldn't read lstart (transient failure)
+ *
+ * Sweep MUST treat "unknown" as do-not-reclaim. A momentary ps hiccup
+ * during broker startup would otherwise wipe out live jobs.
+ *
+ * @param {number} pid
+ * @param {string} expectedLstart
+ * @returns {"alive"|"dead"|"unknown"}
+ */
+function classifyOwnerForSweep(pid, expectedLstart) {
+  if (!isAlive(pid)) return "dead";
+  const cur = readLstart(pid);
+  if (cur === null) return "unknown";
+  return cur === expectedLstart ? "alive" : "dead";
+}
+
+/**
+ * Walk $STATE_DIR/jobs and finalise any non-terminal jobs whose worker /
+ * Claude processes are gone. Per DESIGN.md "孤儿作业（仅非终态）":
+ *
+ *   - queued: only check worker_pid identity; failure → orphaned.
+ *   - running: BOTH worker_pid AND claude_pid must look dead before we
+ *     mark it orphan. If either is still alive, leave it alone — the
+ *     normal exit path will close it out.
+ *   - terminal states are NEVER touched.
+ *
+ * All writes go through finalizeJobIfNonTerminal, so we can never
+ * accidentally overwrite a state that became terminal in between.
+ */
+export async function sweepOrphanedJobs() {
+  let entries;
+  try {
+    entries = readdirSync(jobsDir(), { withFileTypes: true });
+  } catch (err) {
+    if (err && err.code === "ENOENT") return; // nothing yet
+    throw err;
+  }
+  for (const ent of entries) {
+    if (!ent.isDirectory()) continue;
+    const job_id = ent.name;
+    const cur = readJobState(job_id);
+    if (!cur) continue; // corrupt or missing state.json — leave alone
+    if (cur.state !== "queued" && cur.state !== "running") continue;
+
+    // Tri-state classifier. ps may transiently fail; treat that as
+    // "unknown" — never reclaim. Only definitively-dead (kill -0 ESRCH)
+    // OR pid-reused (lstart mismatch) counts as "dead" for sweep.
+    const workerStatus = classifyOwnerForSweep(
+      cur.worker_pid,
+      cur.worker_lstart_raw,
+    );
+    const claudeStatus =
+      cur.claude_pid && cur.claude_lstart_raw
+        ? classifyOwnerForSweep(cur.claude_pid, cur.claude_lstart_raw)
+        : "absent";
+
+    let orphaned = false;
+    if (cur.state === "queued") {
+      // queued has no claude pid yet; orphan iff worker is definitely dead.
+      orphaned = workerStatus === "dead";
+    } else {
+      // running: both must be dead OR absent. "unknown" for either side
+      // means we can't safely conclude they're gone.
+      const workerDeadOrAbsent =
+        workerStatus === "dead" || workerStatus === "absent";
+      const claudeDeadOrAbsent =
+        claudeStatus === "dead" || claudeStatus === "absent";
+      orphaned = workerDeadOrAbsent && claudeDeadOrAbsent;
+    }
+
+    if (orphaned) {
+      await finalizeJobIfNonTerminal(job_id, {
+        state: "failed",
+        error: "orphaned",
+        ended_at_ms: Date.now(),
+      }).catch((err) => {
+        process.stderr.write(
+          `[cc-plugin-codex] failed to mark ${job_id} orphaned: ${String(err)}\n`,
+        );
+      });
+    }
+  }
 }
 
 /**
