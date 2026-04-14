@@ -287,6 +287,49 @@ test("runClaude: real Claude CLI 'No conversation found' triggers fallback", asy
   }
 });
 
+test("runClaude: resume fallback shares the timeoutMs budget across attempts", async () => {
+  // Total budget 200ms. First attempt takes ~150ms before failing with
+  // "no conversation found"; second attempt should run with ~50ms
+  // remaining budget, NOT a fresh full 200ms.
+  try {
+    let callCount = 0;
+    let secondTimeoutSeen = null;
+    _internals.spawn = (bin, argv) => {
+      callCount += 1;
+      const f = fakeChild();
+      if (callCount === 1) {
+        setTimeout(() => {
+          f.emitStderr("No conversation found with session ID: x");
+          f.close(1);
+        }, 150);
+      } else {
+        // Capture: at the time the second spawn happens, the budget left
+        // should be ~50ms. We can't assert it directly, but we observe
+        // the wall-clock — the second call must time out fast.
+        secondTimeoutSeen = Date.now();
+        // Hang forever; rely on shared budget to kill us within ~50ms.
+        return f.child;
+      }
+      return f.child;
+    };
+    const start = Date.now();
+    const res = await runClaude({
+      flags: ["-p", "--resume", "x"],
+      prompt: "",
+      timeoutMs: 200,
+      graceMs: 5,
+    });
+    const elapsed = Date.now() - start;
+    assert.equal(res.resume_retried, true);
+    // The total wall-clock should be close to 200ms (first 150 + second
+    // ~50), with some slack for JS scheduling. Definitely NOT 200+200.
+    assert.ok(elapsed < 350, `expected ~200ms, took ${elapsed}ms`);
+    assert.equal(res.error, "timeout");
+  } finally {
+    restore();
+  }
+});
+
 test("runClaude: 'no session with id' stderr also triggers fallback", async () => {
   try {
     let callCount = 0;

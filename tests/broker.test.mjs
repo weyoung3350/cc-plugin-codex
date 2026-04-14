@@ -3,6 +3,9 @@ import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
 
 import { EventEmitter } from "node:events";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 import { buildBroker, isDirectInvocation } from "../plugins/cc/scripts/claude-broker.mjs";
 import {
@@ -15,6 +18,15 @@ const ORIG_SPAWN = healthInternals.spawnSync;
 const ORIG_READ_SETTINGS = healthInternals.readSettings;
 const ORIG_RUN_SPAWN = runInternals.spawn;
 const ORIG_ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
+const ORIG_STATE_DIR = process.env.CC_PLUGIN_CODEX_STATE_DIR;
+
+/** Per-test scratch dir used when a test passes session_id (so the lock
+ * has a writable state root and doesn't collide with other tests). */
+let activeScratchDir = null;
+function setupScratchStateDir() {
+  activeScratchDir = fs.mkdtempSync(path.join(os.tmpdir(), "ccpc-broker-"));
+  process.env.CC_PLUGIN_CODEX_STATE_DIR = activeScratchDir;
+}
 
 function restoreEnv() {
   healthInternals.spawnSync = ORIG_SPAWN;
@@ -23,25 +35,53 @@ function restoreEnv() {
   _setCached(null);
   if (ORIG_ANTHROPIC_KEY === undefined) delete process.env.ANTHROPIC_API_KEY;
   else process.env.ANTHROPIC_API_KEY = ORIG_ANTHROPIC_KEY;
+  if (ORIG_STATE_DIR === undefined)
+    delete process.env.CC_PLUGIN_CODEX_STATE_DIR;
+  else process.env.CC_PLUGIN_CODEX_STATE_DIR = ORIG_STATE_DIR;
+  if (activeScratchDir) {
+    try {
+      fs.rmSync(activeScratchDir, { recursive: true, force: true });
+    } catch {}
+    activeScratchDir = null;
+  }
 }
 
 /** Build a fake child for runClaude's async spawn. */
-function fakeRunChild({ stdout = "", stderr = "", exitCode = 0 } = {}) {
+function fakeRunChild({ stdout = "", stderr = "", exitCode = 0, delayMs = 0 } = {}) {
   const emitter = new EventEmitter();
+  let scheduled = null;
+  let closed = false;
   const child = {
     stdin: new PassThrough(),
     stdout: new PassThrough(),
     stderr: new PassThrough(),
     on: emitter.on.bind(emitter),
-    kill: () => {},
+    kill: (signal) => {
+      // Real Claude obeys SIGTERM quickly; mimic that so broker's grace
+      // window doesn't dominate test wall-clock.
+      if (closed) return;
+      if (scheduled) clearTimeout(scheduled);
+      // Tear down on next tick with the signal Node would surface.
+      setImmediate(() => {
+        if (closed) return;
+        closed = true;
+        child.stdout.end();
+        child.stderr.end();
+        emitter.emit("close", null, signal ?? "SIGTERM");
+      });
+    },
   };
-  setImmediate(() => {
+  const finish = () => {
+    if (closed) return;
+    closed = true;
     if (stdout) child.stdout.write(stdout);
     if (stderr) child.stderr.write(stderr);
     child.stdout.end();
     child.stderr.end();
     emitter.emit("close", exitCode, null);
-  });
+  };
+  if (delayMs > 0) scheduled = setTimeout(finish, delayMs);
+  else setImmediate(finish);
   return child;
 }
 
@@ -91,10 +131,11 @@ function startHarness(server) {
   function send(obj) {
     input.write(JSON.stringify(obj) + "\n");
   }
-  async function nextMessage() {
-    for (let i = 0; i < 100; i++) {
+  async function nextMessage(maxWaitMs = 5000) {
+    const start = Date.now();
+    while (Date.now() - start < maxWaitMs) {
       if (outbox.length > 0) return outbox.shift();
-      await new Promise((r) => setTimeout(r, 2));
+      await new Promise((r) => setTimeout(r, 5));
     }
     throw new Error("timeout");
   }
@@ -337,6 +378,7 @@ test("broker: claude_ask returns text + metadata on success", async () => {
 
 test("broker: claude_ask with session_id sets session_persisted=true", async () => {
   try {
+    setupScratchStateDir();
     mockHealthHappy();
     const env = JSON.stringify({
       type: "result",
@@ -661,6 +703,367 @@ test("broker: claude_review with non-JSON result returns claude-output-malformed
       assert.equal(resp.result.isError, true);
       const parsed = JSON.parse(resp.result.content[0].text);
       assert.equal(parsed.error, "claude-output-malformed");
+    } finally {
+      close();
+    }
+  } finally {
+    restoreEnv();
+  }
+});
+
+test("broker: same session_id calls run serialised", async () => {
+  try {
+    setupScratchStateDir();
+    mockHealthHappy();
+    /** @type {string[]} */
+    const order = [];
+    let inflight = 0;
+    let maxInflight = 0;
+    runInternals.spawn = (bin, argv) => {
+      const idx = order.length;
+      order.push(`spawn-${idx}`);
+      inflight += 1;
+      maxInflight = Math.max(maxInflight, inflight);
+      const env = JSON.stringify({
+        type: "result",
+        result: `ok-${idx}`,
+        session_id: "S-1",
+      });
+      // Hold the child open for ~80 ms so concurrency would be observable
+      // if serialisation were broken.
+      const f = fakeRunChild({ stdout: env, exitCode: 0, delayMs: 80 });
+      f.on("close", () => {
+        inflight -= 1;
+      });
+      return f;
+    };
+    const server = buildBroker();
+    const { send, nextMessage, close } = startHarness(server);
+    try {
+      send({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2024-11-05" },
+      });
+      await nextMessage();
+      // Fire two concurrent calls with the same session_id.
+      send({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: {
+          name: "claude_ask",
+          arguments: { prompt: "first", session_id: "S-1" },
+        },
+      });
+      send({
+        jsonrpc: "2.0",
+        id: 3,
+        method: "tools/call",
+        params: {
+          name: "claude_ask",
+          arguments: { prompt: "second", session_id: "S-1" },
+        },
+      });
+      await nextMessage();
+      await nextMessage();
+      assert.equal(maxInflight, 1, `expected serial; saw ${maxInflight} inflight`);
+    } finally {
+      close();
+    }
+  } finally {
+    restoreEnv();
+  }
+});
+
+test("broker: different session_ids run concurrently", async () => {
+  try {
+    setupScratchStateDir();
+    mockHealthHappy();
+    let inflight = 0;
+    let maxInflight = 0;
+    runInternals.spawn = () => {
+      inflight += 1;
+      maxInflight = Math.max(maxInflight, inflight);
+      const env = JSON.stringify({ type: "result", result: "ok" });
+      const f = fakeRunChild({ stdout: env, exitCode: 0, delayMs: 80 });
+      f.on("close", () => {
+        inflight -= 1;
+      });
+      return f;
+    };
+    const server = buildBroker();
+    const { send, nextMessage, close } = startHarness(server);
+    try {
+      send({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2024-11-05" },
+      });
+      await nextMessage();
+      send({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: {
+          name: "claude_ask",
+          arguments: { prompt: "a", session_id: "S-A" },
+        },
+      });
+      send({
+        jsonrpc: "2.0",
+        id: 3,
+        method: "tools/call",
+        params: {
+          name: "claude_ask",
+          arguments: { prompt: "b", session_id: "S-B" },
+        },
+      });
+      await nextMessage();
+      await nextMessage();
+      assert.ok(maxInflight >= 2, `expected concurrent; saw ${maxInflight}`);
+    } finally {
+      close();
+    }
+  } finally {
+    restoreEnv();
+  }
+});
+
+test("broker: lock-wait timeout returns timeout error with phase=lock-wait", async () => {
+  try {
+    setupScratchStateDir();
+    mockHealthHappy();
+    // First call holds the lock for 2 seconds; second call has 1 second
+    // budget, so it MUST time out in lock-wait.
+    let spawnIdx = 0;
+    runInternals.spawn = () => {
+      spawnIdx += 1;
+      const env = JSON.stringify({ type: "result", result: `x${spawnIdx}` });
+      // First spawn: hold lock 2 s. Subsequent: instant.
+      const delay = spawnIdx === 1 ? 2000 : 0;
+      return fakeRunChild({ stdout: env, exitCode: 0, delayMs: delay });
+    };
+    const server = buildBroker();
+    const { send, nextMessage, close } = startHarness(server);
+    try {
+      send({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2024-11-05" },
+      });
+      await nextMessage();
+      send({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: {
+          name: "claude_ask",
+          arguments: { prompt: "first", session_id: "S-LOCK", timeout_sec: 30 },
+        },
+      });
+      await new Promise((r) => setTimeout(r, 50));
+      send({
+        jsonrpc: "2.0",
+        id: 3,
+        method: "tools/call",
+        params: {
+          name: "claude_ask",
+          arguments: { prompt: "second", session_id: "S-LOCK", timeout_sec: 1 },
+        },
+      });
+      // r3 (second response) arrives FIRST because it times out at ~1s
+      // while r2 keeps holding.
+      const r3 = await nextMessage(3000);
+      assert.equal(r3.result.isError, true);
+      const parsed = JSON.parse(r3.result.content[0].text);
+      assert.equal(parsed.error, "timeout");
+      assert.equal(parsed.phase, "lock-wait");
+      assert.equal(parsed.lock_reason, "timeout");
+      assert.ok(parsed.duration_ms >= 900 && parsed.duration_ms <= 2000);
+      // Drain r2 so we don't leak to other tests.
+      await nextMessage(3000);
+    } finally {
+      close();
+    }
+  } finally {
+    restoreEnv();
+  }
+});
+
+test("broker: total timeout budget is shared across lock-wait + run phases", async () => {
+  try {
+    setupScratchStateDir();
+    mockHealthHappy();
+    // First holds 400ms; second has 2s budget. Lock-wait should consume
+    // ~400ms, leaving ~1.6s for the run phase. The second spawn hangs;
+    // it must time out in the RUN phase (not lock-wait).
+    let spawnIdx = 0;
+    runInternals.spawn = () => {
+      spawnIdx += 1;
+      const env = JSON.stringify({ type: "result", result: "x" });
+      if (spawnIdx === 1) {
+        return fakeRunChild({ stdout: env, exitCode: 0, delayMs: 400 });
+      }
+      // Second spawn: never completes within budget.
+      const f = fakeRunChild({ stdout: env, exitCode: 0, delayMs: 10000 });
+      return f;
+    };
+    const server = buildBroker();
+    const { send, nextMessage, close } = startHarness(server);
+    try {
+      send({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2024-11-05" },
+      });
+      await nextMessage();
+      send({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: {
+          name: "claude_ask",
+          arguments: { prompt: "a", session_id: "S-BUDGET", timeout_sec: 30 },
+        },
+      });
+      await new Promise((r) => setTimeout(r, 30));
+      send({
+        jsonrpc: "2.0",
+        id: 3,
+        method: "tools/call",
+        params: {
+          name: "claude_ask",
+          arguments: { prompt: "b", session_id: "S-BUDGET", timeout_sec: 2 },
+        },
+      });
+      const r2 = await nextMessage(5000); // 1st finishes ~400ms
+      const r3 = await nextMessage(5000); // 2nd times out shortly after
+      assert.equal(r2.result.isError, false);
+      assert.equal(r3.result.isError, true);
+      const parsed = JSON.parse(r3.result.content[0].text);
+      assert.equal(parsed.error, "timeout");
+      // Critical: phase should be "run" because lock-wait consumed budget
+      // BUT didn't fail — the run phase did.
+      assert.equal(parsed.phase, "run");
+    } finally {
+      close();
+    }
+  } finally {
+    restoreEnv();
+  }
+});
+
+test("broker: lock-wait that exhausts budget refuses to spawn", async () => {
+  try {
+    setupScratchStateDir();
+    mockHealthHappy();
+    let spawnCount = 0;
+    runInternals.spawn = () => {
+      spawnCount += 1;
+      const env = JSON.stringify({ type: "result", result: "x" });
+      const f = fakeRunChild({ stdout: env, exitCode: 0, delayMs: 1500 });
+      return f;
+    };
+    const server = buildBroker();
+    const { send, nextMessage, close } = startHarness(server);
+    try {
+      send({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2024-11-05" },
+      });
+      await nextMessage();
+      // First call holds the lock for ~1.5s (one spawn).
+      send({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: {
+          name: "claude_ask",
+          arguments: { prompt: "first", session_id: "S-EX", timeout_sec: 30 },
+        },
+      });
+      await new Promise((r) => setTimeout(r, 30));
+      // Second call has 1s budget; first holds 1.5s; lock-wait will
+      // consume the entire budget before the lock is released. Broker
+      // must NOT spawn a second Claude.
+      send({
+        jsonrpc: "2.0",
+        id: 3,
+        method: "tools/call",
+        params: {
+          name: "claude_ask",
+          arguments: { prompt: "second", session_id: "S-EX", timeout_sec: 1 },
+        },
+      });
+      const r3 = await nextMessage(3000);
+      assert.equal(r3.result.isError, true);
+      const parsed = JSON.parse(r3.result.content[0].text);
+      assert.equal(parsed.error, "timeout");
+      assert.equal(parsed.phase, "lock-wait");
+      // Drain r2 so we don't leak.
+      await nextMessage(3000);
+      // CRITICAL: spawnCount must be 1 — the second call never got to
+      // claude.
+      assert.equal(spawnCount, 1, `expected 1 spawn, got ${spawnCount}`);
+    } finally {
+      close();
+    }
+  } finally {
+    restoreEnv();
+  }
+});
+
+test("broker: one-shot calls (no session_id) do NOT serialise", async () => {
+  try {
+    setupScratchStateDir();
+    mockHealthHappy();
+    let inflight = 0;
+    let maxInflight = 0;
+    runInternals.spawn = () => {
+      inflight += 1;
+      maxInflight = Math.max(maxInflight, inflight);
+      const env = JSON.stringify({ type: "result", result: "x" });
+      const f = fakeRunChild({ stdout: env, exitCode: 0, delayMs: 80 });
+      f.on("close", () => {
+        inflight -= 1;
+      });
+      return f;
+    };
+    const server = buildBroker();
+    const { send, nextMessage, close } = startHarness(server);
+    try {
+      send({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2024-11-05" },
+      });
+      await nextMessage();
+      send({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: { name: "claude_ask", arguments: { prompt: "x" } },
+      });
+      send({
+        jsonrpc: "2.0",
+        id: 3,
+        method: "tools/call",
+        params: { name: "claude_ask", arguments: { prompt: "y" } },
+      });
+      await nextMessage();
+      await nextMessage();
+      assert.ok(
+        maxInflight >= 2,
+        `one-shot must run concurrently; saw ${maxInflight}`,
+      );
     } finally {
       close();
     }

@@ -113,7 +113,27 @@ export async function runClaude(opts) {
   ) {
     const retryFlags = rewriteResumeToSessionId(firstFlags);
     if (retryFlags) {
-      const second = await runOnce({ ...opts, flags: retryFlags });
+      // Subtract the time already spent on the first attempt from the
+      // run-phase budget so the total run-phase wall-clock honours the
+      // caller's timeoutMs even across the fallback. If the budget is
+      // already exhausted, surface a clean timeout instead of silently
+      // hanging or giving the second call infinite time.
+      const remainingMs =
+        typeof opts.timeoutMs === "number"
+          ? opts.timeoutMs - first.duration_ms
+          : undefined;
+      if (typeof remainingMs === "number" && remainingMs <= 0) {
+        return {
+          ...first,
+          error: "timeout",
+          resume_retried: true,
+        };
+      }
+      const second = await runOnce({
+        ...opts,
+        flags: retryFlags,
+        timeoutMs: remainingMs,
+      });
       second.resume_retried = true;
       // Preserve the aggregate duration so callers can time-budget correctly.
       second.duration_ms += first.duration_ms;

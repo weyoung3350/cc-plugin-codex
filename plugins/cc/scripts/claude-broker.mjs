@@ -30,6 +30,13 @@ import {
   validateReviewOutput,
   ReviewValidationError,
 } from "./lib/review-schema.mjs";
+import {
+  acquire as acquireSessionLock,
+  release as releaseSessionLock,
+  SessionLockError,
+} from "./lib/session-lock.mjs";
+
+import { randomUUID } from "node:crypto";
 
 const SERVER_NAME = "cc-plugin-codex";
 const SERVER_VERSION = "0.0.1";
@@ -81,6 +88,79 @@ async function runSyncTool(toolName, permission, schema, args) {
     throw err;
   }
 
+  // 1b. Session serialisation. We only acquire a lock when the caller
+  // supplied a session_id — one-shot calls are independent and skip
+  // entirely. Lock-wait time IS counted in the caller's timeout_sec.
+  const callerSessionId =
+    typeof args.session_id === "string" && args.session_id.length > 0
+      ? args.session_id
+      : null;
+  /** @type {import("./lib/session-lock.mjs").LockHandle | null} */
+  let lock = null;
+  const totalTimeoutMs =
+    typeof args.timeout_sec === "number"
+      ? Math.max(1, Math.floor(args.timeout_sec)) * 1000
+      : undefined;
+  const lockStartMs = Date.now();
+  if (callerSessionId !== null) {
+    try {
+      lock = await acquireSessionLock(callerSessionId, {
+        timeoutMs: totalTimeoutMs ?? Infinity,
+        requestId: `${toolName}-${randomUUID()}`,
+      });
+    } catch (err) {
+      if (err instanceof SessionLockError) {
+        // Map each lock failure mode to a distinct tool error so callers
+        // (and humans tailing logs) can tell apart "queue overrun" from
+        // "fs broken" from "ps unavailable on this system".
+        const errorCode = (() => {
+          switch (err.reason) {
+            case "timeout":
+              return "timeout";
+            case "would-block":
+              return "session-busy";
+            case "lstart-unreadable":
+              return "lstart-unreadable";
+            case "io-error":
+            default:
+              return "lock-io-error";
+          }
+        })();
+        return toolErrorResult(errorCode, err.message, {
+          phase: "lock-wait",
+          duration_ms: Date.now() - lockStartMs,
+          lock_reason: err.reason,
+        });
+      }
+      throw err;
+    }
+  }
+
+  try {
+    return await runSyncToolBody(
+      toolName,
+      permission,
+      schema,
+      args,
+      callerSessionId,
+      totalTimeoutMs,
+      lockStartMs,
+    );
+  } finally {
+    if (lock) releaseSessionLock(lock);
+  }
+}
+
+/** Body of a synchronous tool call once the session lock is held. */
+async function runSyncToolBody(
+  toolName,
+  permission,
+  schema,
+  args,
+  callerSessionId,
+  totalTimeoutMs,
+  lockStartMs,
+) {
   // 2. Build argv.
   let flags;
   try {
@@ -103,18 +183,34 @@ async function runSyncTool(toolName, permission, schema, args) {
     flags.push("--model", args.model);
   }
 
-  // 3. Run claude.
-  const timeoutMs =
-    typeof args.timeout_sec === "number"
-      ? Math.max(1, Math.floor(args.timeout_sec)) * 1000
-      : undefined;
+  // 3. Run claude. Subtract the time we already spent waiting for the
+  // session lock from the run-phase budget so the caller's total
+  // timeout_sec is honoured end-to-end. If lock-wait already consumed the
+  // entire budget, fail fast WITHOUT spawning Claude — otherwise we'd
+  // overshoot the caller's deadline.
+  let runTimeoutMs = totalTimeoutMs;
+  const lockWaitMs = Date.now() - lockStartMs;
+  if (typeof runTimeoutMs === "number") {
+    runTimeoutMs = runTimeoutMs - lockWaitMs;
+    if (runTimeoutMs <= 0) {
+      return toolErrorResult(
+        "timeout",
+        "timeout_sec exhausted by session lock-wait; not spawning",
+        {
+          phase: "lock-wait",
+          duration_ms: lockWaitMs,
+          lock_reason: "budget-exhausted",
+        },
+      );
+    }
+  }
   const prompt = typeof args.prompt === "string" ? args.prompt : "";
 
   const run = await runClaude({
     flags,
     prompt,
     cwd: process.cwd(),
-    timeoutMs,
+    timeoutMs: runTimeoutMs,
   });
 
   // 4. Classify outcome.
@@ -149,10 +245,8 @@ async function runSyncTool(toolName, permission, schema, args) {
   //   - caller passed session_id → echo it back, session_persisted=true
   //   - caller did NOT pass → force null + persisted=false, even if Claude
   //     happened to emit a session_id under --no-session-persistence
-  const callerSessionId =
-    typeof args.session_id === "string" && args.session_id.length > 0
-      ? args.session_id
-      : null;
+  // (callerSessionId is computed once at the top of runSyncTool and
+  // threaded through; do not re-derive it here.)
   const commonMeta = {
     session_id: callerSessionId,
     session_persisted: callerSessionId !== null,
