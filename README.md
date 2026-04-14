@@ -6,12 +6,12 @@
 
 ## 当前状态
 
-🚧 **设计阶段**，尚未开始实现。
+🏗 **Phase 1 完成**：MCP 握手 + `claude_health` 可用；其余工具为 stub，按设计分阶段落地。
 
-经过 11 轮跨模型设计评审，已产出可直接实施的零 Critical 技术方案，详见：
-
-- [需求文档](./docs/REQUIREMENTS.md)
-- [设计文档（v8b）](./docs/DESIGN.md)
+- 经过 11 轮跨模型设计评审，零 Critical 落地方案：[需求文档](./docs/REQUIREMENTS.md) · [设计文档 v8b](./docs/DESIGN.md)
+- 每个实现任务都走 **实现 → Codex 评审 → 修 Critical → 复核** 循环
+- 单元测试 74/74 通过；本地 MCP 冒烟已验证 Codex ↔ broker 握手
+- 后续阶段：Phase 2（同步 ask/review）、Phase 3（session 串行）、Phase 4（task 权限分级）、Phase 5（后台作业）、Phase 6（skills）、Phase 7（marketplace/文档）、Phase 8（回归 fixture）
 
 ## 设计亮点
 
