@@ -2,19 +2,28 @@
 //
 // Contract (docs/DESIGN.md):
 //   - Probe on broker startup; cache result in-process.
-//   - Probe Claude using the same flags as real claude_ask calls, so that a
+//   - Probe Claude using the same flags as real claude_ask calls, so a
 //     successful probe is a strong predicate for real calls working.
-//   - Report: installed / version / authenticated / bare_compatible /
-//     api_key_source / platform_supported / warnings[] / checked_at_ms.
+//   - Report: installed / version / authenticated / api_key_source /
+//     platform_supported / warnings[] / checked_at_ms.
 //   - Non-claude_health tools MUST gate on assertHealthy().
 //   - claude_health({ refresh: true }) triggers a reprobe. No TTL.
 //
-// Runtime model:
-//   - `claude --version` → installed + version.
-//   - `claude -p <ask-flags> "ok"` → authenticated + bare_compatible.
-//   - API-key source is derived from env (ANTHROPIC_API_KEY / apiKeyHelper).
-//     apiKeyHelper lives in ~/.claude/settings.json; we treat it as a soft
-//     signal and only read $ANTHROPIC_API_KEY from env directly.
+// Auth model (post-`--bare` removal):
+//   We do NOT force any auth path. Whichever auth Claude resolves on its
+//   own — OAuth keychain (subscription) OR ANTHROPIC_API_KEY OR
+//   apiKeyHelper — counts as "authenticated". `api_key_source` is best-
+//   effort metadata: "env" if $ANTHROPIC_API_KEY is set, "helper" if
+//   ~/.claude/settings.json carries apiKeyHelper, "oauth" if neither but
+//   the live probe still succeeds (implying keychain auth), else null.
+//
+// Failure detection:
+//   - status=0 + JSON envelope without is_error  → fully healthy
+//   - status!=0 + JSON envelope with is_error and result mentions
+//       "Credit balance is too low"              → key valid, billing empty
+//   - status!=0 + JSON envelope with is_error and result mentions
+//       authentication / api key                 → key invalid / not logged in
+//   - status!=0 and no parseable JSON            → environment failure
 
 import { spawnSync as realSpawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
@@ -45,8 +54,7 @@ export const _internals = {
  * @property {boolean} installed
  * @property {string=} version
  * @property {boolean} authenticated
- * @property {boolean} bare_compatible
- * @property {"env" | "helper" | null=} api_key_source
+ * @property {"env" | "helper" | "oauth" | null=} api_key_source
  * @property {boolean} platform_supported
  * @property {string[]} warnings
  * @property {number} checked_at_ms
@@ -75,7 +83,6 @@ export function probeHealth(opts = {}) {
       installed: false,
       version: undefined,
       authenticated: false,
-      bare_compatible: false,
       api_key_source: null,
       platform_supported: false,
       warnings: ["platform-unsupported"],
@@ -102,10 +109,13 @@ export function probeHealth(opts = {}) {
   }
 
   // --- Step 2: api key source ---
-  // Precedence matches how `claude --bare` resolves auth:
+  // Pre-probe metadata: which auth source we *think* Claude will pick up.
+  // The live probe below may overwrite this (e.g. set "oauth" if neither
+  // env nor helper is configured but auth still succeeded).
   //   1. $ANTHROPIC_API_KEY (env)
   //   2. apiKeyHelper field in ~/.claude/settings.json
-  //   Anything else (OAuth / keychain) is intentionally unsupported in bare mode.
+  //   3. (after probe) OAuth keychain → "oauth"
+  //   4. nothing detected → null
   let api_key_source = /** @type {"env"|"helper"|null} */ (null);
   if (
     typeof process.env.ANTHROPIC_API_KEY === "string" &&
@@ -124,16 +134,18 @@ export function probeHealth(opts = {}) {
     }
   }
 
-  // --- Step 3: live bare-mode probe ---
+  // --- Step 3: live probe ---
   // Mirrors the real claude_ask flags so "health pass" ⇒ "ask should work".
   let authenticated = false;
-  let bare_compatible = false;
   if (installed && platform_supported) {
+    // Pass the prompt via stdin (NOT as a positional argv) — `--add-dir`
+    // and `--tools` are variadic, and a trailing positional would be
+    // swallowed as another value, causing Claude to error out with
+    // "Input must be provided either through stdin or as a prompt argument".
     const probeRes = safeSpawn(
       bin,
       [
         "-p",
-        "--bare",
         "--strict-mcp-config",
         "--no-session-persistence",
         "--output-format=json",
@@ -142,24 +154,57 @@ export function probeHealth(opts = {}) {
         "Read,Grep,Glob",
         "--add-dir",
         cwd,
-        "ok",
       ],
-      { cwd, timeoutMs: PROBE_TIMEOUT_MS },
+      { cwd, timeoutMs: PROBE_TIMEOUT_MS, input: "ok" },
     );
-    if (probeRes.ok && typeof probeRes.stdout === "string") {
-      // Expect a JSON envelope with a `result` field; we don't parse its
-      // contents — any well-formed JSON response is enough to confirm
-      // "Claude started, authenticated, and produced output".
+    // Authentication / capability classification (Claude 2.1.x behaviour):
+    //   - status=0 + JSON envelope w/o is_error  → fully healthy
+    //   - status=1 + JSON envelope w/ is_error=true and result contains
+    //       "Credit balance is too low"          → key valid, billing empty
+    //   - status=1 + JSON w/ is_error=true and result mentions
+    //       authentication / api key             → key invalid
+    //   - status!=0 and no parseable JSON        → environment failure
+    let parsed = null;
+    if (typeof probeRes.stdout === "string" && probeRes.stdout.length > 0) {
       try {
-        const parsed = JSON.parse(probeRes.stdout);
-        if (parsed && typeof parsed === "object") {
-          authenticated = true;
-          bare_compatible = true;
-        } else {
-          warnings.push("probe-non-json-response");
-        }
+        parsed = JSON.parse(probeRes.stdout);
       } catch {
-        warnings.push("probe-json-parse-failed");
+        // fall through
+      }
+    }
+    if (probeRes.ok && (!parsed || typeof parsed !== "object")) {
+      // Spawn succeeded but stdout wasn't structured JSON — surface
+      // distinctly so users can tell apart "Claude died" from "Claude
+      // returned garbage".
+      warnings.push("probe-non-json");
+    }
+    if (parsed && typeof parsed === "object") {
+      const isErr = parsed.is_error === true;
+      const resultStr = typeof parsed.result === "string" ? parsed.result : "";
+      if (!isErr && probeRes.ok) {
+        authenticated = true;
+        // If we authenticated successfully but neither env nor settings
+        // helper is configured, the auth must have come from the OAuth
+        // keychain (Claude subscription).
+        if (api_key_source === null) api_key_source = "oauth";
+      } else if (/credit balance is too low/i.test(resultStr)) {
+        // Key authenticates (so Anthropic accepted it) but the API account
+        // has no funds. We surface this distinctly so users don't waste
+        // time chasing auth bugs — and still mark unauthenticated, since
+        // real calls will fail.
+        warnings.push("credit-exhausted");
+      } else if (
+        /authenticat|api.?key|invalid.*key|unauthori[sz]ed|please.*log/i.test(resultStr) ||
+        (probeRes.stderr &&
+          /authenticat|api.?key|invalid.*key|please.*log/i.test(probeRes.stderr))
+      ) {
+        warnings.push("auth-required");
+      } else if (isErr) {
+        warnings.push(
+          `probe-error:${resultStr.slice(0, 80) || "unknown"}`,
+        );
+      } else {
+        warnings.push("probe-non-success-result");
       }
     } else if (probeRes.err === "TIMEOUT") {
       warnings.push("probe-timeout");
@@ -174,7 +219,6 @@ export function probeHealth(opts = {}) {
     installed,
     version,
     authenticated,
-    bare_compatible,
     api_key_source,
     platform_supported,
     warnings,
@@ -246,6 +290,7 @@ function safeSpawn(cmd, args, opts = {}) {
       encoding: "utf8",
       timeout: opts.timeoutMs,
       windowsHide: true,
+      input: opts.input,
     });
     // Timeout on Node 22 surfaces as error.code === "ETIMEDOUT" plus a
     // non-null res.signal (usually "SIGTERM"). Check that first so we

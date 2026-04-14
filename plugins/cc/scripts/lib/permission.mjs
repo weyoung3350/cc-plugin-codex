@@ -12,7 +12,7 @@
 // constraint set. We revisit after Phase 5.
 //
 // Regardless of level we always apply:
-//   --bare --strict-mcp-config --output-format=json --add-dir <cwd>
+//   --strict-mcp-config --output-format=json --add-dir <cwd>
 //
 // Session flag emission (independent of permission level):
 //   - session_id present + useResume=true   → "--resume <session_id>"
@@ -30,9 +30,20 @@ import { isUnderStateDir, realpathOrResolve } from "./xdg.mjs";
 
 /** @typedef {"plan" | "writes"} PermissionLevel */
 
+// Base flags applied to every claude -p invocation:
+//   -p                       : print mode (one-shot)
+//   --strict-mcp-config      : ignore any MCP server NOT explicitly passed via
+//                              --mcp-config; this is what blocks Claude from
+//                              discovering and calling our own broker (recursion).
+//   --output-format=json     : structured envelope so we can parse result/cost.
+//
+// We deliberately DO NOT pass --bare. That flag also disables the OAuth
+// keychain, which is the only auth path for Claude subscription users. The
+// recursion / env-drift concerns that --bare was originally meant to address
+// are covered by --strict-mcp-config alone; CLAUDE.md auto-discovery and
+// hooks are kept enabled because they're features users expect, not risks.
 const BASE_FLAGS = Object.freeze([
   "-p",
-  "--bare",
   "--strict-mcp-config",
   "--output-format=json",
 ]);

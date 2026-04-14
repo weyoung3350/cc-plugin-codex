@@ -40,7 +40,6 @@ function summariseHealth(s) {
     `installed=${s.installed}`,
     `version=${s.version ?? "unknown"}`,
     `authenticated=${s.authenticated}`,
-    `bare_compatible=${s.bare_compatible}`,
     `api_key_source=${s.api_key_source ?? "none"}`,
     `platform_supported=${s.platform_supported}`,
   ];
@@ -219,7 +218,7 @@ function healthErrorToolResult(err) {
       "not-installed":
         "Install Claude Code CLI >= 2.1.105: https://docs.claude.com/en/docs/claude-code",
       "auth-required":
-        "Set ANTHROPIC_API_KEY, or configure apiKeyHelper in ~/.claude/settings.json. OAuth keychain is not supported under --bare.",
+        "Run `claude /login` to log in with your Claude subscription, OR set ANTHROPIC_API_KEY, OR configure apiKeyHelper in ~/.claude/settings.json.",
       "platform-unsupported":
         "cc-plugin-codex supports macOS and Linux only. Windows is intentionally unsupported.",
     }[reason] ?? "See claude_health for diagnostic detail.";
@@ -246,7 +245,7 @@ export function buildBroker() {
   server.registerTool({
     name: "claude_health",
     description:
-      "探测本机 Claude Code 安装与认证状态，返回安装情况、认证情况、--bare 模式兼容性等诊断。传 { refresh: true } 强制重新探测（否则返回缓存结果）。",
+      "探测本机 Claude Code 安装与认证状态，返回安装情况、认证情况（订阅 OAuth / API key / apiKeyHelper）、平台兼容性等诊断。传 { refresh: true } 强制重新探测（否则返回缓存结果）。",
     inputSchema: {
       type: "object",
       properties: {

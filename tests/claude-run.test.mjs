@@ -251,6 +251,42 @@ test("runClaude: resumeFallback=false disables retry", async () => {
   }
 });
 
+test("runClaude: real Claude CLI 'No conversation found' triggers fallback", async () => {
+  // This is the actual stderr Claude 2.1.107 emits — verified end-to-end.
+  // Regression guard: if upstream changes this string, runClaude breaks
+  // session continuity silently unless we extend the pattern set.
+  try {
+    let callCount = 0;
+    _internals.spawn = () => {
+      callCount += 1;
+      const f = fakeChild();
+      if (callCount === 1) {
+        setImmediate(() => {
+          f.emitStderr(
+            "No conversation found with session ID: 385b64d2-5d2f-4468-b58e-be80104ff699\n",
+          );
+          f.close(1);
+        });
+      } else {
+        setImmediate(() => {
+          f.emitStdout("created");
+          f.close(0);
+        });
+      }
+      return f.child;
+    };
+    const res = await runClaude({
+      flags: ["-p", "--resume", "385b64d2-5d2f-4468-b58e-be80104ff699"],
+      prompt: "",
+    });
+    assert.equal(callCount, 2, "expected fallback retry");
+    assert.equal(res.resume_retried, true);
+    assert.equal(res.text, "created");
+  } finally {
+    restore();
+  }
+});
+
 test("runClaude: 'no session with id' stderr also triggers fallback", async () => {
   try {
     let callCount = 0;

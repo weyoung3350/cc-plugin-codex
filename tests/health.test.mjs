@@ -45,7 +45,7 @@ test("probeHealth: not installed when claude --version spawn fails with ENOENT",
     const s = probeHealth();
     assert.equal(s.installed, false);
     assert.equal(s.authenticated, false);
-    assert.equal(s.bare_compatible, false);
+    // bare_compatible removed; this branch just verifies installed=false.
     assert.ok(s.warnings.includes("claude-not-installed"));
   } finally {
     restore();
@@ -79,7 +79,7 @@ test("probeHealth: happy path sets all flags", () => {
     assert.equal(s.installed, true);
     assert.equal(s.version, "2.1.105");
     assert.equal(s.authenticated, true);
-    assert.equal(s.bare_compatible, true);
+    // bare_compatible removed: probe success itself is the predicate.
     assert.equal(s.api_key_source, "env");
     assert.equal(s.platform_supported, process.platform === "darwin" || process.platform === "linux");
   } finally {
@@ -121,7 +121,7 @@ test("probeHealth: probe returns non-JSON → warns, not authenticated", () => {
     const s = probeHealth();
     assert.equal(s.installed, true);
     assert.equal(s.authenticated, false);
-    assert.ok(s.warnings.some((w) => w.includes("probe-json-parse-failed")));
+    assert.ok(s.warnings.some((w) => w.includes("probe-non-json")));
   } finally {
     restore();
   }
@@ -241,7 +241,7 @@ test("probeHealth: api_key_source = helper when settings.apiKeyHelper present", 
   }
 });
 
-test("probeHealth: api_key_source = null when no env and no settings", () => {
+test("probeHealth: api_key_source = oauth when probe succeeds without env/helper", () => {
   try {
     delete process.env.ANTHROPIC_API_KEY;
     _internals.readSettings = () => null;
@@ -250,7 +250,33 @@ test("probeHealth: api_key_source = null when no env and no settings", () => {
       probe: { error: null, status: 0, stdout: "{}", stderr: "", signal: null },
     });
     const s = probeHealth();
+    // Subscription/OAuth path: env and helper are both absent yet the
+    // probe authenticated → infer OAuth keychain.
+    assert.equal(s.api_key_source, "oauth");
+    assert.equal(s.authenticated, true);
+  } finally {
+    restore();
+  }
+});
+
+test("probeHealth: api_key_source = null when probe fails and no env/helper", () => {
+  try {
+    delete process.env.ANTHROPIC_API_KEY;
+    _internals.readSettings = () => null;
+    _internals.spawnSync = fakeSpawn({
+      version: { error: null, status: 0, stdout: "2.1.105\n", stderr: "", signal: null },
+      probe: {
+        error: null,
+        status: 1,
+        stdout: '{"is_error":true,"result":"please log in"}',
+        stderr: "",
+        signal: null,
+      },
+    });
+    const s = probeHealth();
     assert.equal(s.api_key_source, null);
+    assert.equal(s.authenticated, false);
+    assert.ok(s.warnings.includes("auth-required"));
   } finally {
     restore();
   }

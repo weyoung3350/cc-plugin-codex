@@ -13,19 +13,20 @@
 ### 采纳 Codex 二审后的 10 个核心收敛
 
 1. **Architecture 薄 broker + 现起子进程**：不维护 in-memory session pool；会话续写全靠 Claude 原生 `--session-id <uuid>` / `--resume`
-2. **默认运行约束**：`--bare --permission-mode=plan --strict-mcp-config --output-format=json`，按需 `--add-dir <cwd>`、`--tools "Read,Grep,Glob"`。**这是默认约束，不是安全沙箱**（README 明写）
+2. **默认运行约束**：`--permission-mode=plan --strict-mcp-config --output-format=json`，按需 `--add-dir <cwd>`、`--tools "Read,Grep,Glob"`。**这是默认约束，不是安全沙箱**（README 明写）
 3. **MCP 工具收敛为 6 个**：`claude_health` / `claude_ask` / `claude_review` / `claude_task` / `claude_job_get` / `claude_cancel`
 4. **后台作业独立 worker 进程**：`detached: true + unref()`，pidfile + logfile 落盘
 5. **`claude_review`**：`--json-schema` + `--output-format=json` 一次性同步
 6. **MVP 权限分级只两级**：`plan`（默认只读） / `writes`（`acceptEdits` + `Read/Edit/Write/Grep/Glob`）。**`allow_shell` 不在 MVP**
 7. **`claude_cancel` 只接受 `{job_id}`**（不支持 `session_id`）：同步调用不支持取消，文档写清
-8. **API key / apiKeyHelper 是前置条件**：`claude_health` 认证不通过直接阻止后续工具调用，**不做非 bare 回退**
+8. **认证三选一**：Claude 自身的认证链生效（OAuth keychain 走订阅 → `ANTHROPIC_API_KEY` → `apiKeyHelper`，按 Claude CLI 自己的优先级）。`claude_health` 认证不通过直接阻止后续工具调用
 9. **平台：macOS / Linux (POSIX)**；不支持 Windows（README metadata 明写）
 10. **所有磁盘写入原子化**：`tmp + rename`；`state.json` 从不半截读
 
 ### 已验证事实
 
-- Claude CLI `2.1.105` 支持全部所需 flags：`--bare`、`--session-id <uuid>`、`--resume`、`--json-schema`、`--permission-mode`、`--strict-mcp-config`、`--tools`、`--add-dir`、`--output-format={text,json,stream-json}`、`--no-session-persistence`
+- Claude CLI `2.1.105+` 支持全部所需 flags：`--session-id <uuid>`、`--resume`、`--json-schema`、`--permission-mode`、`--strict-mcp-config`、`--tools`、`--add-dir`、`--output-format={text,json,stream-json}`、`--no-session-persistence`
+- **不使用 `--bare`**：早期方案曾考虑用 `--bare` 隔离环境，但它会同时禁掉 OAuth keychain，让订阅用户无法使用。本设计把"防递归"职责完全交给 `--strict-mcp-config`（足以阻止 Claude 自动发现并调用本插件 MCP），CLAUDE.md / hooks / auto-memory 等本机配置保留生效。
 - Codex 插件系统约定：`.codex-plugin/plugin.json` + `skills/*/SKILL.md` + `agents/*.yaml` + `.mcp.json` + `assets/`（已在 `~/.codex/plugins/cache/openai-curated/build-web-apps/` 实物验证）
 - Codex 侧无 hooks、无 slash commands —— 用户入口就是 MCP 工具由 Codex 模型自主发现和调用
 
@@ -258,7 +259,7 @@ spawnSync('ps', ['-o', 'lstart=', '-p', String(pid)], { env: { ...process.env, L
 
 | 工具 | 输入 | 返回 | Claude 调用形态 |
 |------|------|------|-----------------|
-| `claude_health` | `{refresh?: bool}` | `{installed, version?, authenticated, bare_compatible, api_key_source?, platform_supported, warnings[], checked_at_ms}` | `claude --version` + `claude -p --bare --strict-mcp-config --no-session-persistence --output-format=json --permission-mode=plan --tools "Read,Grep,Glob" --add-dir <cwd> "ok"`（与正式 `claude_ask` 完全同 flags，仅无 session、无 add_dirs 扩展；避免漂移） |
+| `claude_health` | `{refresh?: bool}` | `{installed, version?, authenticated, api_key_source: "oauth"\|"env"\|"helper"\|null, platform_supported, warnings[], checked_at_ms}` | `claude --version` + `claude -p --strict-mcp-config --no-session-persistence --output-format=json --permission-mode=plan --tools "Read,Grep,Glob" --add-dir <cwd>`（prompt "ok" 经 stdin 而非 argv，避免被 `--add-dir`/`--tools` variadic 吞掉；与正式 `claude_ask` 同 flags 避免漂移） |
 | `claude_ask` | `{prompt, session_id?, model?, add_dirs?: string[], timeout_sec?: int}` | `{text, session_id, session_persisted, cost_usd?, duration_ms, truncated: bool, captured_bytes, total_bytes?}` | `claude -p --output-format=json --bare --permission-mode=plan --strict-mcp-config --tools "Read,Grep,Glob" --add-dir <cwd> [每个 add_dirs 追加 --add-dir] <session 分支> <prompt>`。**session 分支唯一协议**（见「session_id 创建/续写协议」小节）：有 `session_id` → 先 `--resume <uuid>`，失败（按 fixture stderr 模式）**同锁内单次 fallback** 到 `--session-id <uuid>`；未传 → **强制** `--no-session-persistence` |
 | `claude_review` | `{target, instructions?, session_id?, timeout_sec?: int}` | review schema 结构体 + `{truncated, captured_bytes, session_id, session_persisted}` | 同 `claude_ask` flags + `--json-schema '<review-output.schema>'`（固定 schema） |
 | `claude_task` | `{task, files?, session_id?, allow_writes?: bool, writes_acknowledged?: bool, background?: bool, timeout_sec?: int}` | 同步: `{text, session_id, session_persisted, cost_usd?, truncated, captured_bytes}`；后台: `{job_id, worker_pid, log_path}` | 同 `claude_ask` flags；`allow_writes=true` 切 writes 级；后台 fork detached worker（worker 持锁 + claude 作为 process group leader） |
@@ -393,7 +394,7 @@ codex mcp get claude-code   # 确认 6 个工具都出现
 
 ### 功能检查点
 
-1. **健康检查**：`claude_health` 分别报告 `installed / authenticated / bare_compatible / api_key_source`，未认证时后续工具直接返回错误
+1. **健康检查**：`claude_health` 分别报告 `installed / authenticated / api_key_source ∈ {oauth, env, helper, null} / platform_supported`，未认证时后续工具直接返回错误
 2. **同步只读**：默认 `claude_ask` plan 模式可问不可改
 3. **原生会话续写**：同一 `session_id` 两次调用记住上下文
 4. **跨 codex-exec 续写**：两个独立 `codex exec` 传同一 `session_id` 仍能续
@@ -413,7 +414,7 @@ codex mcp get claude-code   # 确认 6 个工具都出现
     - `queued`：只校验 `worker_pid`。`sameIdentity` 失败 → 标记 `state=failed, error="orphaned"`
     - `running`：必须 `sameIdentity(worker_pid, worker_lstart_raw)` **和** `sameIdentity(claude_pid, claude_lstart_raw)` **双双失活**才算孤儿。任一仍活（例如 worker 死但 claude 还在跑）则**保持 running 不动**（由 Claude 自然结束路径或下次 cancel 处理）
     - 所有写入走 `finalizeJobIfNonTerminal()` 原子 RMW（见下文 helper）
-18. **环境隔离对照实验**：在 cwd 放一个带唯一标记字符串 `XYZZY-CANARY-42` 的 `CLAUDE.md`；`claude_ask("你看到 XYZZY-CANARY-42 了吗？")` 在默认 `--bare` 下**应回答没看到**，移除 `--bare`（验证开关反证）应看到；以此证明隔离确实生效
+18. **递归防御对照实验**：本插件**不再使用 `--bare`**（订阅 OAuth 兼容性需要），改用 `--strict-mcp-config` 阻止 Claude 子进程发现并调用本插件 MCP（避免 Claude→Codex→Claude 互调）。验证：在测试夹具里向 Claude 注入一个伪 `~/.claude.json` 注册一个 `cc-plugin-codex` MCP server，然后 `claude_ask("列出你能用的 MCP 工具")`；在我们的 `--strict-mcp-config` 下 **不应** 出现 `claude_*` 工具；移除 `--strict-mcp-config` 反证应出现。CLAUDE.md / hooks / auto-memory 不再做隔离声明（设计上已允许它们生效）。
 19. **原子写**：并发写 `state.json` 时任何读取必须读到完整 JSON（非半截）
 20. **`allow_writes` 硬约束 + 固定模板存在性**：自动化校验两点（模型行为不纳入 CI）：① `grep` `claude-delegation-runtime/SKILL.md` 存在固定提醒模板字符串；② broker ack gate：flag 不存在时 `claude_task(allow_writes=true, writes_acknowledged=undefined)` 返回 `error: "writes-need-acknowledgement"`；传 `writes_acknowledged=true` 后写 flag 成功
 21. **平台**：macOS / Linux 跑通全部用例；Windows 启动时 `claude_health` 返回 `warnings: ["platform-unsupported"]`
@@ -442,10 +443,10 @@ codex mcp get claude-code   # 确认 6 个工具都出现
 ## 风险与留意项（v8b）
 
 ### 安全/边界
-- **这不是安全沙箱**：默认约束（`--bare --strict-mcp-config --permission-mode=plan`）能阻止常见误操作，但用户若传大 `add_dirs` 或 `allow_writes=true`，Claude 会在允许范围内自由读写。README 第一屏用粗体声明
+- **这不是安全沙箱**：默认约束（`--strict-mcp-config --permission-mode=plan`）能阻止 MCP 递归互调和常见误操作，但用户若传大 `add_dirs` 或 `allow_writes=true`，Claude 会在允许范围内自由读写；CLAUDE.md / hooks / auto-memory 也都生效（这是订阅 OAuth 可用的必要代价）。README 第一屏用粗体声明
 - **Codex approval 被绕过**：`claude_task(allow_writes=true)` 下 Claude 的文件修改不经 Codex 自身审批。SKILL.md 附**固定模板**（逐字）要求 Codex 模型首次调用时向用户显式确认
 - **`allow_shell` 不在 MVP**：Bash 工具会让默认约束失去意义，后续版本单独评估
-- **认证前置**：`claude_health` 未认证（`api_key_source === null`）时，所有其他工具直接返回 `{error: "auth-required", hint: ...}`，**不做非 bare 回退**（回退会破坏默认约束）
+- **认证前置**：`claude_health` `authenticated=false` 时，所有其他工具直接返回 `{error: "auth-required", hint: "...登录命令..."}`。Claude 自身的认证链按 OAuth keychain → `ANTHROPIC_API_KEY` → `apiKeyHelper` 顺序生效；订阅用户运行 `claude /login` 即可。`api_key_source` 在 probe 成功且 env/helper 都没配时反推为 `"oauth"`
 
 ### 运行时
 - **并发锁**：mkdir 用户态锁 + `{owner_pid, owner_lstart_raw}` 双因子 stale reclaim（`sameIdentity` 失败才强制释放）；heartbeat 仅作诊断，不触发回收；否则等 `timeout_sec` 放弃。详见「并发模型」

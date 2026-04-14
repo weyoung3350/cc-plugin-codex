@@ -29,12 +29,12 @@ test("buildClaudeFlags: plan mode emits read-only tools + base flags", () => {
       permission: "plan",
       cwd: "/tmp/work",
     });
-    assert.deepEqual(flags.slice(0, 4), [
+    assert.deepEqual(flags.slice(0, 3), [
       "-p",
-      "--bare",
       "--strict-mcp-config",
       "--output-format=json",
     ]);
+    assert.ok(!flags.includes("--bare"), "--bare must NOT be set (subscription support)");
     assert.ok(flags.includes("--permission-mode=plan"));
     const toolsIdx = flags.indexOf("--tools");
     assert.equal(flags[toolsIdx + 1], "Read,Grep,Glob");

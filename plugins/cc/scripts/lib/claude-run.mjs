@@ -48,7 +48,14 @@ export const _internals = {
  * disambiguate. If Claude changes this string we'll fall through to a
  * regular `nonzero` error — safe-fail, not over-eager retry.
  */
+// stderr patterns Claude CLI emits when --resume is given a session it
+// hasn't seen before. Verified empirically against Claude 2.1.107:
+//   "No conversation found with session ID: <uuid>"
+// We keep older patterns too because Claude has changed this string at
+// least twice; broad coverage here is the difference between "session
+// auto-create works" and "session_id is unusable for new sessions".
 const SESSION_NOT_FOUND_PATTERNS = [
+  /no conversation found/i,
   /no such session/i,
   /session not found/i,
   /could not find session/i,
