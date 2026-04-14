@@ -22,6 +22,14 @@ import {
   assertHealthy,
   HealthError,
 } from "./lib/health.mjs";
+import { buildClaudeFlags, PermissionError } from "./lib/permission.mjs";
+import { runClaude, parseClaudeJson } from "./lib/claude-run.mjs";
+import {
+  REVIEW_SCHEMA,
+  formatReviewPrompt,
+  validateReviewOutput,
+  ReviewValidationError,
+} from "./lib/review-schema.mjs";
 
 const SERVER_NAME = "cc-plugin-codex";
 const SERVER_VERSION = "0.0.1";
@@ -40,6 +48,167 @@ function summariseHealth(s) {
     parts.push(`warnings=[${s.warnings.join(",")}]`);
   }
   return parts.join(" ");
+}
+
+/** Wrap any tool error into the standard MCP content envelope. */
+function toolErrorResult(error, hint, extras = {}) {
+  return {
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify({ error, hint, ...extras }, null, 2),
+      },
+    ],
+    isError: true,
+  };
+}
+
+/**
+ * Shared runtime for claude_ask and claude_review.
+ *
+ * @param {string} toolName
+ * @param {"plan"|"writes"} permission
+ * @param {object|null} schema   If non-null, inject --json-schema + validate
+ *                               the JSON result against review schema.
+ * @param {object} args
+ * @returns {Promise<object>}
+ */
+async function runSyncTool(toolName, permission, schema, args) {
+  // 1. Health gate (cached).
+  try {
+    assertHealthy();
+  } catch (err) {
+    if (err instanceof HealthError) return healthErrorToolResult(err);
+    throw err;
+  }
+
+  // 2. Build argv.
+  let flags;
+  try {
+    flags = buildClaudeFlags({
+      permission,
+      cwd: process.cwd(),
+      add_dirs: args.add_dirs,
+      session_id: args.session_id,
+      useResume: true, // resume-first protocol
+      schema: schema ?? undefined,
+    });
+  } catch (err) {
+    if (err instanceof PermissionError) {
+      return toolErrorResult(err.reason, err.message);
+    }
+    throw err;
+  }
+
+  if (typeof args.model === "string" && args.model.length > 0) {
+    flags.push("--model", args.model);
+  }
+
+  // 3. Run claude.
+  const timeoutMs =
+    typeof args.timeout_sec === "number"
+      ? Math.max(1, Math.floor(args.timeout_sec)) * 1000
+      : undefined;
+  const prompt = typeof args.prompt === "string" ? args.prompt : "";
+
+  const run = await runClaude({
+    flags,
+    prompt,
+    cwd: process.cwd(),
+    timeoutMs,
+  });
+
+  // 4. Classify outcome.
+  if (run.error === "timeout") {
+    return toolErrorResult("timeout", "claude run exceeded timeout", {
+      phase: "run",
+      partial_text: run.text,
+      captured_bytes: run.captured_bytes,
+      duration_ms: run.duration_ms,
+    });
+  }
+  if (run.error === "nonzero") {
+    return toolErrorResult("claude-nonzero-exit", "claude exited with an error", {
+      exit_code: run.exit_code,
+      exit_signal: run.exit_signal,
+      stderr: run.stderr,
+      resume_retried: run.resume_retried,
+    });
+  }
+
+  // 5. Parse Claude's JSON envelope.
+  const parsed = parseClaudeJson(run.text);
+  if (parsed.result === null) {
+    return toolErrorResult(
+      "claude-output-malformed",
+      "Claude's JSON envelope is missing .result",
+      { raw: run.text.slice(0, 4096) },
+    );
+  }
+
+  // session_id contract (DESIGN.md):
+  //   - caller passed session_id → echo it back, session_persisted=true
+  //   - caller did NOT pass → force null + persisted=false, even if Claude
+  //     happened to emit a session_id under --no-session-persistence
+  const callerSessionId =
+    typeof args.session_id === "string" && args.session_id.length > 0
+      ? args.session_id
+      : null;
+  const commonMeta = {
+    session_id: callerSessionId,
+    session_persisted: callerSessionId !== null,
+    cost_usd: parsed.total_cost_usd,
+    duration_ms: run.duration_ms,
+    truncated: run.truncated,
+    captured_bytes: run.captured_bytes,
+    total_bytes: run.total_bytes,
+  };
+
+  // 6. Optional: schema-backed tools extract+validate the structured result.
+  if (schema !== null) {
+    let reviewObj;
+    try {
+      reviewObj = JSON.parse(parsed.result);
+    } catch {
+      // Unify with the non-schema malformed path: any "Claude returned text
+      // that isn't structured" fault uses the same error code.
+      return toolErrorResult(
+        "claude-output-malformed",
+        "Claude's --json-schema result did not parse as JSON",
+        { raw: parsed.result.slice(0, 4096), ...commonMeta },
+      );
+    }
+    try {
+      validateReviewOutput(reviewObj);
+    } catch (err) {
+      if (err instanceof ReviewValidationError) {
+        return toolErrorResult(
+          "claude-review-schema-mismatch",
+          err.message,
+          { field: err.field, detail: err.detail, ...commonMeta },
+        );
+      }
+      throw err;
+    }
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({ ...reviewObj, ...commonMeta }, null, 2),
+        },
+      ],
+      isError: false,
+    };
+  }
+
+  // 7. Non-schema tools just return text.
+  return {
+    content: [
+      { type: "text", text: parsed.result },
+      { type: "text", text: JSON.stringify(commonMeta, null, 2) },
+    ],
+    isError: false,
+  };
 }
 
 /** Wrap a HealthError into the standard MCP tool error envelope. */
@@ -100,18 +269,99 @@ export function buildBroker() {
     },
   });
 
+  // --- claude_ask (Phase 2) -------------------------------------------------
+  server.registerTool({
+    name: "claude_ask",
+    description:
+      "向 Claude Code 提问，默认只读（plan 模式，只开 Read/Grep/Glob 工具）。可通过 session_id 续写；不传则本次不持久化 session。返回 {text, session_id, session_persisted, cost_usd, duration_ms, truncated, captured_bytes, total_bytes}。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        prompt: { type: "string", minLength: 1 },
+        session_id: { type: "string" },
+        model: { type: "string" },
+        add_dirs: { type: "array", items: { type: "string" } },
+        timeout_sec: { type: "integer", minimum: 1, maximum: 1800 },
+      },
+      required: ["prompt"],
+      additionalProperties: false,
+    },
+    handler: (args) => {
+      // mcp-server doesn't enforce JSON-schema; do the prompt validation
+      // explicitly so we get a clean error instead of feeding "" to Claude.
+      if (typeof args?.prompt !== "string" || args.prompt.length === 0) {
+        return toolErrorResult(
+          "invalid-prompt",
+          "claude_ask: prompt must be a non-empty string",
+        );
+      }
+      return runSyncTool("claude_ask", "plan", null, args);
+    },
+  });
+
+  // --- claude_review (Phase 2) ---------------------------------------------
+  server.registerTool({
+    name: "claude_review",
+    description:
+      "委托 Claude 做结构化代码审查。输出严格遵循固定 schema（--json-schema 注入 + broker 侧结构校验）。返回 schema 对象 + {session_id, session_persisted, truncated, captured_bytes, duration_ms}。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        target: {
+          anyOf: [
+            { type: "string", minLength: 1 },
+            {
+              type: "array",
+              minItems: 1,
+              items: { type: "string", minLength: 1 },
+            },
+          ],
+        },
+        instructions: { type: "string" },
+        session_id: { type: "string" },
+        timeout_sec: { type: "integer", minimum: 1, maximum: 1800 },
+      },
+      required: ["target"],
+      additionalProperties: false,
+    },
+    handler: (args) => {
+      let prompt;
+      try {
+        prompt = formatReviewPrompt({
+          target: args?.target,
+          instructions: args?.instructions,
+        });
+      } catch (err) {
+        // Only the documented validation errors are turned into invalid-target;
+        // anything else propagates so we don't silently mask formatter bugs.
+        if (
+          err instanceof Error &&
+          /^formatReviewPrompt: target/.test(err.message)
+        ) {
+          return toolErrorResult("invalid-target", err.message);
+        }
+        throw err;
+      }
+      // Restrict the args we pass to runSyncTool to those explicitly
+      // declared in claude_review's inputSchema. This stops callers from
+      // smuggling add_dirs/model/etc through claude_review (which is
+      // intentionally narrower than claude_ask).
+      const sanitisedArgs = {
+        prompt,
+        session_id: args?.session_id,
+        timeout_sec: args?.timeout_sec,
+      };
+      return runSyncTool(
+        "claude_review",
+        "plan",
+        REVIEW_SCHEMA,
+        sanitisedArgs,
+      );
+    },
+  });
+
   // --- stubs for upcoming phases -------------------------------------------
   const stubTools = [
-    {
-      name: "claude_ask",
-      description:
-        "向 Claude Code 提问。默认只读（plan）模式。完整实现将在 Phase 2 落地；当前为占位。",
-    },
-    {
-      name: "claude_review",
-      description:
-        "委托 Claude 做结构化代码审查（输出受 --json-schema 约束）。完整实现将在 Phase 2 落地；当前为占位。",
-    },
     {
       name: "claude_task",
       description:

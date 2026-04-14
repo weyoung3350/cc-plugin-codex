@@ -9,6 +9,7 @@
 
 import os from "node:os";
 import path from "node:path";
+import { realpathSync } from "node:fs";
 
 const APP_NAME = "cc-plugin-codex";
 
@@ -125,8 +126,11 @@ export function ackFlagPath(workspaceRoot) {
  * @returns {boolean}
  */
 export function isUnderStateDir(candidate) {
-  const root = path.resolve(stateRoot());
-  const c = path.resolve(candidate);
+  // Realpath both sides so symlinks can't disguise an escape.
+  // On macOS /tmp is itself a symlink to /private/tmp, so this is required
+  // even for "normal" paths — not only for user-created symlinks.
+  const root = realpathOrResolve(stateRoot());
+  const c = realpathOrResolve(candidate);
   if (c === root) return true;
   const rel = path.relative(root, c);
   if (rel.length === 0) return true;
@@ -136,4 +140,34 @@ export function isUnderStateDir(candidate) {
   if (rel === "..") return false;
   if (rel.startsWith(".." + path.sep)) return false;
   return true;
+}
+
+/**
+ * Realpath an absolute path; if it doesn't exist, walk up to the nearest
+ * existing ancestor and append the remaining tail. Falls back to
+ * path.resolve if no ancestor exists.
+ *
+ * Exported so permission.mjs (and anything else that needs to compare paths
+ * to $STATE_DIR) can use the same resolution policy.
+ *
+ * @param {string} absPath
+ * @returns {string}
+ */
+export function realpathOrResolve(absPath) {
+  try {
+    return realpathSync(absPath);
+  } catch {
+    let parent = path.dirname(absPath);
+    const tail = [path.basename(absPath)];
+    while (parent !== path.dirname(parent)) {
+      try {
+        const real = realpathSync(parent);
+        return path.join(real, ...tail.reverse());
+      } catch {
+        tail.push(path.basename(parent));
+        parent = path.dirname(parent);
+      }
+    }
+    return path.resolve(absPath);
+  }
 }
