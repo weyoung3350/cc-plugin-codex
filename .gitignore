@@ -9,3 +9,4 @@ coverage/
 *.tsbuildinfo
 .env
 .env.local
+.tmp-xdg-state/
