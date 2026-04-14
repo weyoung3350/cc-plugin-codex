@@ -6,7 +6,7 @@
 
 ## 当前状态
 
-🚀 **Phase 1-7 完成**（功能 + 文档落地）；Phase 8（回归 fixture / CI）剩。
+🎉 **8 个 Phase 全部完成**。MVP 功能闭环，可在本机用 `codex mcp add` 直接装载试用。
 
 | Phase | 范围 | 状态 |
 |-------|------|------|
@@ -17,11 +17,12 @@
 | 5 | 后台 worker + `claude_job_get` + `claude_cancel` + orphan sweep | ✅ |
 | 6 | 3 个 SKILL.md（delegation-runtime / result-handling / prompting） | ✅ |
 | 7 | marketplace agent yaml + 用户文档 + license | ✅ |
-| 8 | fake-claude-fixture + 21 checkpoint 自动化回归 | ⏳ |
+| 8 | fake-claude-fixture + 21 checkpoint 矩阵 + lib 层 e2e | ✅ |
 
 - 设计：[需求文档](./docs/REQUIREMENTS.md) · [设计文档 v8b](./docs/DESIGN.md)（11 轮跨模型评审，零 Critical 落地）
 - 每个实现任务都走 **实现 → Codex 评审 → 修 Critical → 复核** 循环
-- **219 个单元测试全绿**；订阅 OAuth 端到端冒烟已通过
+- **228 个测试全绿**（219 单元 + 9 lib 层 e2e）；checkpoint 覆盖矩阵：[`tests/CHECKPOINTS.md`](./tests/CHECKPOINTS.md)
+- 真实订阅 OAuth 端到端冒烟通过（XYZZY-2026 跨 broker 进程会话续写实测）
 
 ## 设计亮点
 
