@@ -23,7 +23,7 @@
   "interface": {
     "displayName": "Claude Code 桥接",
     "shortDescription": "从 Codex 委托任务给本机 Claude Code，并取回结构化结果",
-    "longDescription": "连接 Codex 与本机 Claude Code CLI 的桥接插件。Codex 模型可以通过 MCP 工具把问题、审查和编辑任务委托给 Claude，并取回结果。用途：向 Claude 询问代码问题、获得第二视角的结构化审查（--json-schema）、委托聚焦的编辑任务。会话通过 Claude 原生 --session-id/--resume 续写。Claude 以受控子运行时运行（--bare --permission-mode=plan --strict-mcp-config）。**这不是安全沙箱**。仅支持 macOS/Linux，不支持 Windows。需要 ANTHROPIC_API_KEY 或 ~/.claude/settings.json 中的 apiKeyHelper。",
+    "longDescription": "连接 Codex 与本机 Claude Code CLI 的桥接插件。Codex 模型可以通过 MCP 工具把问题、审查和编辑任务委托给 Claude，并取回结果。用途：向 Claude 询问代码问题、获得第二视角的结构化审查（--json-schema）、委托聚焦的编辑任务。会话通过 Claude 原生 --session-id/--resume 续写。Claude 以受控子运行时运行（--permission-mode=plan --strict-mcp-config）。**这不是安全沙箱**。仅支持 macOS/Linux，不支持 Windows。需要 ANTHROPIC_API_KEY、Claude 订阅 OAuth，或 ~/.claude/settings.json 中的 apiKeyHelper。",
     "developerName": "weyoung3350",
     "category": "Coding",
     "capabilities": [
@@ -32,6 +32,10 @@
       "Write"
     ],
     "websiteURL": "https://github.com/weyoung3350/cc-plugin-codex",
-    "defaultPrompt": "让 Claude Code 审查这段改动，或委托一个聚焦的编辑任务给它。"
+    "defaultPrompt": [
+      "让 Claude Code 审查这段改动。",
+      "把这个聚焦的编辑任务委托给 Claude Code。",
+      "让 Claude Code 给出第二视角的结构化审查。"
+    ]
   }
 }

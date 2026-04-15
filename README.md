@@ -6,7 +6,7 @@
 
 ## 当前状态
 
-🎉 **8 个 Phase 全部完成**。MVP 功能闭环，可在本机用 `codex mcp add` 直接装载试用。
+🎉 **8 个 Phase 全部完成**。功能和元数据已收口，可在本机直接安装，也已补齐 repo 级 marketplace 清单。
 
 | Phase | 范围 | 状态 |
 |-------|------|------|
@@ -21,7 +21,7 @@
 
 - 设计：[需求文档](./docs/REQUIREMENTS.md) · [设计文档 v8b](./docs/DESIGN.md)（11 轮跨模型评审，零 Critical 落地）
 - 每个实现任务都走 **实现 → Codex 评审 → 修 Critical → 复核** 循环
-- **228 个测试全绿**（219 单元 + 9 lib 层 e2e）；checkpoint 覆盖矩阵：[`tests/CHECKPOINTS.md`](./tests/CHECKPOINTS.md)
+- **232 个测试全绿**；checkpoint 覆盖矩阵：[`tests/CHECKPOINTS.md`](./tests/CHECKPOINTS.md)
 - 真实订阅 OAuth 端到端冒烟通过（XYZZY-2026 跨 broker 进程会话续写实测）
 
 ## 设计亮点
